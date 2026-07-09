@@ -1,0 +1,18 @@
+# dependencies
+/node_modules
+
+# next.js build output
+/.next/
+/out/
+
+# lokale database (SQLite file)
+/data/*.db
+/data/*.db-journal
+
+# env files
+.env
+.env.local
+
+# misc
+.DS_Store
+*.log
