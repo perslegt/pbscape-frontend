@@ -87,6 +87,7 @@ export async function POST(request: NextRequest) {
   const result = handleSubmission({
     playerName: playerName.trim(),
     bossSlug,
+    bossName: boss.trim(),
     timeMillis: Math.round(timeMillis),
     gameMessage: typeof gameMessage === "string" ? gameMessage : undefined,
     pluginVersion: typeof pluginVersion === "string" ? pluginVersion : undefined,
@@ -149,6 +150,7 @@ export async function PUT(request: NextRequest) {
     const res = handleSubmission({
       playerName: playerName.trim(),
       bossSlug,
+      bossName: boss.trim(),
       timeMillis,
       gameMessage: (pb as any).gameMessage,
       pluginVersion: (pb as any).pluginVersion,

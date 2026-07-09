@@ -43,7 +43,7 @@ if (process.env.NODE_ENV !== "production") {
 // Iets betere prestaties/gedrag voor een lokale SQLite-file.
 db.pragma("journal_mode = WAL");
 
-// New schema: bosses, personal_bests (current bests), pb_submissions (all incoming)
+// CREATE TABLES
 db.exec(`
   CREATE TABLE IF NOT EXISTS bosses (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -51,7 +51,23 @@ db.exec(`
     name TEXT NOT NULL,
     min_time_millis INTEGER NULL,
     max_time_millis INTEGER NULL,
-    is_active INTEGER NOT NULL DEFAULT 1
+    is_active INTEGER NOT NULL DEFAULT 0
+  );
+`);
+
+db.exec(`
+  CREATE TABLE IF NOT EXISTS personal_bests (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    player_name TEXT NOT NULL,
+    boss_id INTEGER NOT NULL,
+    time_millis INTEGER NOT NULL,
+    source TEXT NOT NULL DEFAULT 'plugin',
+    screenshot_url TEXT NULL,
+    game_message TEXT NULL,
+    submitted_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY (boss_id) REFERENCES bosses(id),
+    UNIQUE(player_name, boss_id)
   );
 `);
 
@@ -73,106 +89,13 @@ db.exec(`
   );
 `);
 
-function personalBestsUsesLegacySchema() {
-  const columns = db.prepare(`PRAGMA table_info('personal_bests')`).all() as Array<{ name: string }>;
-  const names = columns.map((column) => column.name);
-  return names.includes("player") && names.includes("boss") && names.includes("time_millis") && !names.includes("boss_id");
-}
+// CREATE INDEXES
+db.exec(`CREATE INDEX IF NOT EXISTS idx_personal_bests_boss_time ON personal_bests (boss_id, time_millis ASC);`);
+db.exec(`CREATE INDEX IF NOT EXISTS idx_personal_bests_player ON personal_bests (player_name);`);
+db.exec(`CREATE INDEX IF NOT EXISTS idx_pb_submissions_player_submitted ON pb_submissions (player_name, submitted_at DESC);`);
+db.exec(`CREATE INDEX IF NOT EXISTS idx_pb_submissions_boss_submitted ON pb_submissions (boss_id, submitted_at DESC);`);
 
-function createOrMigratePersonalBestsTable() {
-  const tableExists = db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='personal_bests'`).get();
-  if (!tableExists) {
-    db.exec(`
-      CREATE TABLE IF NOT EXISTS personal_bests (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        player_name TEXT NOT NULL,
-        boss_id INTEGER NOT NULL,
-        time_millis INTEGER NOT NULL,
-        source TEXT NOT NULL DEFAULT 'plugin',
-        screenshot_url TEXT NULL,
-        game_message TEXT NULL,
-        submitted_at TEXT NOT NULL,
-        updated_at TEXT NOT NULL,
-        FOREIGN KEY (boss_id) REFERENCES bosses(id),
-        UNIQUE(player_name, boss_id)
-      );
-    `);
-    return;
-  }
-
-  if (!personalBestsUsesLegacySchema()) {
-    return;
-  }
-
-  const legacyRows = db.prepare(`SELECT player, boss, time_millis, submitted_at FROM personal_bests`).all() as Array<{ player: string; boss: string; time_millis: number; submitted_at: string }>;
-
-  db.transaction(() => {
-    db.exec(`ALTER TABLE personal_bests RENAME TO personal_bests_legacy;`);
-    db.exec(`
-      CREATE TABLE personal_bests (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        player_name TEXT NOT NULL,
-        boss_id INTEGER NOT NULL,
-        time_millis INTEGER NOT NULL,
-        source TEXT NOT NULL DEFAULT 'plugin',
-        screenshot_url TEXT NULL,
-        game_message TEXT NULL,
-        submitted_at TEXT NOT NULL,
-        updated_at TEXT NOT NULL,
-        FOREIGN KEY (boss_id) REFERENCES bosses(id),
-        UNIQUE(player_name, boss_id)
-      );
-    `);
-
-    const findBoss = db.prepare(`SELECT id FROM bosses WHERE slug = ?`);
-    const insertBoss = db.prepare(`INSERT INTO bosses (slug, name, is_active) VALUES (?, ?, 1)`);
-    const insertPB = db.prepare(`INSERT OR IGNORE INTO personal_bests (player_name, boss_id, time_millis, source, submitted_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)`);
-    const updatePB = db.prepare(`UPDATE personal_bests SET time_millis = ?, updated_at = ? WHERE id = ?`);
-    const insertSub = db.prepare(`INSERT INTO pb_submissions (player_name, boss_id, time_millis, source, submitted_at, accepted) VALUES (?, ?, ?, ?, ?, 1)`);
-
-    for (const row of legacyRows) {
-      const bossSlug = slugify(row.boss || "");
-      let boss = findBoss.get(bossSlug) as { id: number } | undefined;
-      if (!boss) {
-        const result = insertBoss.run(bossSlug, row.boss || bossSlug);
-        boss = { id: Number(result.lastInsertRowid) };
-      }
-
-      const submittedAt = row.submitted_at || new Date().toISOString();
-      const updatedAt = submittedAt;
-
-      insertSub.run(row.player, boss.id, row.time_millis, "legacy", submittedAt);
-
-      const existing = db.prepare(`SELECT id, time_millis FROM personal_bests WHERE player_name = ? AND boss_id = ?`).get(row.player, boss.id) as { id: number; time_millis: number } | undefined;
-      if (!existing) {
-        insertPB.run(row.player, boss.id, row.time_millis, "legacy", submittedAt, updatedAt);
-      } else if (row.time_millis < existing.time_millis) {
-        updatePB.run(row.time_millis, updatedAt, existing.id);
-      }
-    }
-  })();
-}
-
-seedBossesIfEmpty();
-createOrMigratePersonalBestsTable();
-
-db.exec(`
-  CREATE INDEX IF NOT EXISTS idx_personal_bests_boss_time ON personal_bests (boss_id, time_millis ASC);
-`);
-
-db.exec(`
-  CREATE INDEX IF NOT EXISTS idx_personal_bests_player ON personal_bests (player_name);
-`);
-
-db.exec(`
-  CREATE INDEX IF NOT EXISTS idx_pb_submissions_player_submitted ON pb_submissions (player_name, submitted_at DESC);
-`);
-
-db.exec(`
-  CREATE INDEX IF NOT EXISTS idx_pb_submissions_boss_submitted ON pb_submissions (boss_id, submitted_at DESC);
-`);
-
-// Seed bosses from the static BOSSES array if table empty
+// HELPER FUNCTIONS (define BEFORE calling)
 function slugify(name: string) {
   return name
     .toLowerCase()
@@ -186,50 +109,18 @@ function seedBossesIfEmpty() {
   const row = db.prepare("SELECT COUNT(*) as count FROM bosses").get() as { count: number };
   if (row.count > 0) return;
 
-  const insert = db.prepare(`INSERT INTO bosses (slug, name) VALUES (?, ?)`);
+  const insert = db.prepare(`INSERT INTO bosses (slug, name, is_active) VALUES (?, ?, ?)`);
   const insertMany = db.transaction((names: string[]) => {
     for (const name of names) {
-      insert.run(slugify(name), name);
+      insert.run(slugify(name), name, 1);
     }
   });
 
   insertMany(BOSSES as unknown as string[]);
 }
 
-seedBossesIfEmpty();
-
-// Seed some personal_bests/submissions for local development if empty
-function seedTestDataIfEmpty() {
-  const row = db.prepare("SELECT COUNT(*) as count FROM personal_bests").get() as { count: number };
-  if (row.count > 0) return;
-
-  const testPlayers = ["Zezima", "Woox", "Framed", "B0aty", "Torvesta"];
-  const now = Date.now();
-  let minutesAgo = 0;
-
-  const bossRows = db.prepare("SELECT id, name FROM bosses ORDER BY id LIMIT 8").all() as { id: number; name: string }[];
-
-  const insertSub = db.prepare(`INSERT INTO pb_submissions (player_name, boss_id, time_millis, source, game_message, submitted_at) VALUES (?, ?, ?, ?, ?, ?)`);
-  const insertPB = db.prepare(`INSERT INTO personal_bests (player_name, boss_id, time_millis, source, submitted_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)`);
-
-  const insertMany = db.transaction(() => {
-    bossRows.forEach((boss, bossIndex) => {
-      testPlayers.forEach((playerIndex) => {
-        const baseSeconds = 40 + bossIndex * 15 + playerIndex * 6;
-        const timeMillis = baseSeconds * 1000 + playerIndex * 137;
-        minutesAgo += 3;
-        const submittedAt = new Date(now - minutesAgo * 60_000).toISOString();
-
-        insertSub.run(testPlayers[playerIndex], boss.id, timeMillis, 'seed', `Seed PB for ${boss.name}`, submittedAt);
-        insertPB.run(testPlayers[playerIndex], boss.id, timeMillis, 'seed', submittedAt, submittedAt);
-      });
-    });
-  });
-
-  insertMany();
-}
-
-seedTestDataIfEmpty();
+// RUN INITIALIZATION
+// seedBossesIfEmpty();
 
 // Helper to map DB rows to PersonalBest type used by frontend
 interface PersonalBestRow {
@@ -293,6 +184,7 @@ export interface SubmitPBResult {
 export function handleSubmission(options: {
   playerName: string;
   bossSlug: string;
+  bossName?: string;
   timeMillis: number;
   gameMessage?: string;
   pluginVersion?: string;
@@ -300,14 +192,15 @@ export function handleSubmission(options: {
   screenshotUrl?: string | null;
   ipAddress?: string | null;
 }): SubmitPBResult {
-  const { playerName, bossSlug, timeMillis, gameMessage, pluginVersion, source = "plugin", screenshotUrl = null, ipAddress = null } = options;
-
+  const { playerName, bossSlug, bossName, timeMillis, gameMessage, pluginVersion, source = "plugin", screenshotUrl = null, ipAddress = null } = options;
   const now = new Date().toISOString();
 
-  // find boss
-  const boss = db.prepare(`SELECT id, name, min_time_millis, max_time_millis, is_active FROM bosses WHERE slug = ?`).get(bossSlug) as any;
-  if (!boss || boss.is_active !== 1) {
-    return { success: false, message: "Unknown or inactive boss" };
+  // Find or create boss
+  let boss = db.prepare(`SELECT id, name, min_time_millis, max_time_millis, is_active FROM bosses WHERE slug = ?`).get(bossSlug) as any;
+  if (!boss) {
+    const insertBoss = db.prepare(`INSERT INTO bosses (slug, name, is_active) VALUES (?, ?, 0)`);
+    const insertResult = insertBoss.run(bossSlug, bossName || bossSlug);
+    boss = { id: Number(insertResult.lastInsertRowid), name: bossName || bossSlug, min_time_millis: null, max_time_millis: null, is_active: 0 };
   }
 
   if (!Number.isFinite(timeMillis) || timeMillis <= 0) {
@@ -322,30 +215,22 @@ export function handleSubmission(options: {
     return { success: false, message: "Submitted time above allowed maximum" };
   }
 
-  // insert submission first
+  // Insert submission first
   const insertSub = db.prepare(`INSERT INTO pb_submissions (player_name, boss_id, time_millis, source, game_message, screenshot_url, plugin_version, ip_address, submitted_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`);
-  const res = insertSub.run(playerName, boss.id, timeMillis, source, gameMessage || null, screenshotUrl, pluginVersion || null, ipAddress, now);
-  const submissionId = res.lastInsertRowid as number;
+  insertSub.run(playerName, boss.id, timeMillis, source, gameMessage || null, screenshotUrl, pluginVersion || null, ipAddress, now);
 
-  // check existing PB
-  const existing = db.prepare(`SELECT * FROM personal_bests WHERE LOWER(player_name) = LOWER(?) AND boss_id = ?`).get(playerName, boss.id) as any;
+  // Check existing PB
+  const existing = db.prepare(`SELECT * FROM personal_bests WHERE player_name = ? AND boss_id = ?`).get(playerName, boss.id) as any;
 
   if (!existing) {
-    // insert new PB
-    const insertPB = db.prepare(`INSERT INTO personal_bests (player_name, boss_id, time_millis, source, screenshot_url, game_message, submitted_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`);
-    insertPB.run(playerName, boss.id, timeMillis, source, screenshotUrl, gameMessage || null, now, now);
-    db.prepare(`UPDATE pb_submissions SET accepted = 1 WHERE id = ?`).run(submissionId);
+    db.prepare(`INSERT INTO personal_bests (player_name, boss_id, time_millis, source, screenshot_url, game_message, submitted_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`).run(playerName, boss.id, timeMillis, source, screenshotUrl, gameMessage || null, now, now);
     return { success: true, message: "New PB saved" };
   }
 
   if (timeMillis < existing.time_millis) {
-    const updatePB = db.prepare(`UPDATE personal_bests SET time_millis = ?, updated_at = ?, source = ?, screenshot_url = ?, game_message = ? WHERE id = ?`);
-    updatePB.run(timeMillis, now, source, screenshotUrl, gameMessage || null, existing.id);
-    db.prepare(`UPDATE pb_submissions SET accepted = 1 WHERE id = ?`).run(submissionId);
+    db.prepare(`UPDATE personal_bests SET time_millis = ?, updated_at = ?, source = ?, screenshot_url = ?, game_message = ? WHERE id = ?`).run(timeMillis, now, source, screenshotUrl, gameMessage || null, existing.id);
     return { success: true, message: "PB updated" };
   }
 
-  // not faster
-  db.prepare(`UPDATE pb_submissions SET accepted = 0, rejection_reason = ? WHERE id = ?`).run("Submitted time is not faster than current PB", submissionId);
   return { success: false, message: "Submitted time is not faster than current PB" };
 }

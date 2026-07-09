@@ -18,7 +18,6 @@ export const BOSSES = [
   "Hespori",
   "TzKal-Zuk",
   "The Leviathan",
-  "Maggot King",
   "Phosanis Nightmare",
   "Phantom Muspah",
   "Royal Titans",
