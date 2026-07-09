@@ -7,8 +7,7 @@
  * {
  *   "player": "TestPlayer",
  *   "boss": "Vorkath",
- *   "timeMillis": 85000,
- *   "apiKey": "dev-token"
+ *   "timeMillis": 85000
  * }
  *
  * Response (voorbeeld bij succes):
@@ -16,93 +15,149 @@
  *
  * Response (voorbeeld bij een tragere tijd):
  * { "success": false, "message": "Submitted time is not faster than current PB" }
+ *
+ * -----------------------------------------------------------------------
+ * PUT /api/pb
+ * -----------------------------------------------------------------------
+ * Endpoint waar spelers al hun PBs in bulk uploaden/synchroniseren.
+ *
+ * Verwachte JSON body:
+ * {
+ *   "player": "TestPlayer",
+ *   "pbs": [
+ *     { "boss": "Vorkath", "timeMillis": 85000 },
+ *     { "boss": "Zulrah", "timeMillis": 120000 },
+ *     ...
+ *   ]
+ * }
+ *
+ * Response (voorbeeld):
+ * {
+ *   "success": true,
+ *   "message": "3 PBs synced",
+ *   "stats": { "total": 3, "updated": 2, "skipped": 1 }
+ * }
  * -----------------------------------------------------------------------
  */
 
 import { NextRequest, NextResponse } from "next/server";
-import { submitPB } from "@/lib/db";
-import { SubmitPBRequest, SubmitPBResponse } from "@/types/pb";
+import { handleSubmission } from "@/lib/db";
+import { SubmitPBRequest, SubmitPBResponse, SyncPBsRequest, SyncPBsResponse } from "@/types/pb";
 
 // Zorgt dat deze route altijd dynamisch wordt uitgevoerd (nooit gecached),
 // want elke request kan de database wijzigen.
 export const dynamic = "force-dynamic";
 
 export async function POST(request: NextRequest) {
-  // 1. Body parsen. Als dit geen geldige JSON is, direct een duidelijke fout.
+  // 1. Body parse
   let body: Partial<SubmitPBRequest>;
   try {
     body = (await request.json()) as Partial<SubmitPBRequest>;
   } catch {
-    return NextResponse.json<SubmitPBResponse>(
-      { success: false, message: "Request body is not valid JSON" },
-      { status: 400 }
-    );
+    return NextResponse.json<SubmitPBResponse>({ success: false, message: "Request body is not valid JSON" }, { status: 400 });
   }
 
-  const { player, boss, timeMillis, apiKey } = body;
+  const { playerName, boss, timeMillis, gameMessage, pluginVersion } = body as SubmitPBRequest;
 
-  // 2. Valideren dat alle verplichte velden aanwezig zijn.
-  if (
-    player === undefined ||
-    boss === undefined ||
-    timeMillis === undefined ||
-    apiKey === undefined
-  ) {
-    return NextResponse.json<SubmitPBResponse>(
-      {
-        success: false,
-        message:
-          "Missing required field(s). Expected: player, boss, timeMillis, apiKey",
-      },
-      { status: 400 }
-    );
+  if (!playerName || !boss || timeMillis === undefined) {
+    return NextResponse.json<SubmitPBResponse>({ success: false, message: "Missing required field(s). Expected: playerName, boss, timeMillis" }, { status: 400 });
   }
 
-  // 3. Type-checks: player/boss moeten strings zijn, timeMillis een getal.
-  if (typeof player !== "string" || player.trim().length === 0) {
-    return NextResponse.json<SubmitPBResponse>(
-      { success: false, message: "'player' must be a non-empty string" },
-      { status: 400 }
-    );
+  if (typeof playerName !== "string" || playerName.trim().length === 0) {
+    return NextResponse.json<SubmitPBResponse>({ success: false, message: "'playerName' must be a non-empty string" }, { status: 400 });
   }
 
   if (typeof boss !== "string" || boss.trim().length === 0) {
-    return NextResponse.json<SubmitPBResponse>(
-      { success: false, message: "'boss' must be a non-empty string" },
-      { status: 400 }
-    );
+    return NextResponse.json<SubmitPBResponse>({ success: false, message: "'boss' must be a non-empty string" }, { status: 400 });
   }
 
   if (typeof timeMillis !== "number" || !Number.isFinite(timeMillis) || timeMillis <= 0) {
-    return NextResponse.json<SubmitPBResponse>(
-      { success: false, message: "'timeMillis' must be a positive number" },
-      { status: 400 }
-    );
+    return NextResponse.json<SubmitPBResponse>({ success: false, message: "'timeMillis' must be a positive number" }, { status: 400 });
   }
 
-  // 4. API key controleren tegen de environment variable.
-  //    Zo kan alleen jouw eigen plugin (die de juiste key kent) PB's insturen.
-  const expectedApiKey = process.env.PB_API_KEY;
+  // normalize boss -> slug
+  const bossSlug = boss
+    .toString()
+    .toLowerCase()
+    .normalize("NFKD")
+    .replace(/[^a-z0-9\s_-]/g, "")
+    .trim()
+    .replace(/\s+/g, "_");
 
-  if (!expectedApiKey) {
-    // Duidelijke server-side fout als de env variable niet is ingesteld,
-    // zodat je dit meteen ziet tijdens development.
-    console.error("PB_API_KEY is not set in the environment.");
-    return NextResponse.json<SubmitPBResponse>(
-      { success: false, message: "Server misconfiguration: PB_API_KEY not set" },
-      { status: 500 }
-    );
-  }
-
-  if (apiKey !== expectedApiKey) {
-    return NextResponse.json<SubmitPBResponse>(
-      { success: false, message: "Invalid API key" },
-      { status: 401 }
-    );
-  }
-
-  // 5. Opslaan (alleen als het de eerste PB is, of een verbetering).
-  const result = submitPB(player.trim(), boss.trim(), Math.round(timeMillis));
+  const result = handleSubmission({
+    playerName: playerName.trim(),
+    bossSlug,
+    timeMillis: Math.round(timeMillis),
+    gameMessage: typeof gameMessage === "string" ? gameMessage : undefined,
+    pluginVersion: typeof pluginVersion === "string" ? pluginVersion : undefined,
+    source: "plugin",
+    ipAddress: null,
+  });
 
   return NextResponse.json<SubmitPBResponse>(result, { status: 200 });
+}
+
+/**
+ * PUT handler: bulk sync van alle PBs van een speler.
+ * Verwerkt alle ingezonden PBs en geeft statistieken terug.
+ */
+export async function PUT(request: NextRequest) {
+  // 1. Body parse
+  let body: Partial<SyncPBsRequest>;
+  try {
+    body = (await request.json()) as Partial<SyncPBsRequest>;
+  } catch {
+    return NextResponse.json<SyncPBsResponse>({ success: false, message: "Request body is not valid JSON" }, { status: 400 });
+  }
+
+  const { playerName, pbs } = body as SyncPBsRequest;
+
+  if (!playerName || !Array.isArray(pbs)) {
+    return NextResponse.json<SyncPBsResponse>({ success: false, message: "Missing required field(s). Expected: playerName, pbs" }, { status: 400 });
+  }
+
+  if (typeof playerName !== "string" || playerName.trim().length === 0) {
+    return NextResponse.json<SyncPBsResponse>({ success: false, message: "'playerName' must be a non-empty string" }, { status: 400 });
+  }
+
+  // validate pb entries
+  for (const pb of pbs) {
+    if (typeof pb !== "object" || pb === null) {
+      return NextResponse.json<SyncPBsResponse>({ success: false, message: "Each PB entry must be an object" }, { status: 400 });
+    }
+
+    const { boss, timeMillis } = pb as any;
+    if (typeof boss !== "string" || boss.trim().length === 0) {
+      return NextResponse.json<SyncPBsResponse>({ success: false, message: "'boss' must be a non-empty string in each PB entry" }, { status: 400 });
+    }
+
+    if (typeof timeMillis !== "number" || !Number.isFinite(timeMillis) || timeMillis <= 0) {
+      return NextResponse.json<SyncPBsResponse>({ success: false, message: "'timeMillis' must be a positive number in each PB entry" }, { status: 400 });
+    }
+  }
+
+  // process entries
+  let updated = 0;
+  let skipped = 0;
+
+  for (const pb of pbs) {
+    const boss = (pb as any).boss as string;
+    const timeMillis = Math.round((pb as any).timeMillis as number);
+
+    const bossSlug = boss.toString().toLowerCase().normalize("NFKD").replace(/[^a-z0-9\s_-]/g, "").trim().replace(/\s+/g, "_");
+
+    const res = handleSubmission({
+      playerName: playerName.trim(),
+      bossSlug,
+      timeMillis,
+      gameMessage: (pb as any).gameMessage,
+      pluginVersion: (pb as any).pluginVersion,
+      source: "plugin",
+      ipAddress: null,
+    });
+
+    if (res.success) updated++; else skipped++;
+  }
+
+  return NextResponse.json<SyncPBsResponse>({ success: true, message: `${updated} PB(s) updated, ${skipped} skipped`, stats: { total: pbs.length, updated, skipped } }, { status: 200 });
 }

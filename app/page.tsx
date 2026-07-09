@@ -1,5 +1,5 @@
 import Link from "next/link";
-import { getLatestPBs } from "@/lib/db";
+import { getLatestSubmissions } from "@/lib/db";
 import { formatTime } from "@/lib/formatTime";
 
 // This page reads live from the database, so always render dynamically
@@ -7,7 +7,7 @@ import { formatTime } from "@/lib/formatTime";
 export const dynamic = "force-dynamic";
 
 export default function HomePage() {
-  const latestPBs = getLatestPBs(10);
+  const latestPBs = getLatestSubmissions(10);
 
   return (
     <div className="space-y-10">
@@ -49,15 +49,15 @@ export default function HomePage() {
                 </tr>
               </thead>
               <tbody>
-                {latestPBs.map((pb) => (
+                {latestPBs.map((pb: any) => (
                   <tr key={pb.id} className="border-t border-neutral-800">
-                    <td className="px-4 py-2 font-medium">{pb.player}</td>
-                    <td className="px-4 py-2">{pb.boss}</td>
+                    <td className="px-4 py-2 font-medium">{pb.player_name}</td>
+                    <td className="px-4 py-2">{pb.boss_name ?? "-"}</td>
                     <td className="px-4 py-2 text-gold">
-                      {formatTime(pb.timeMillis)}
+                      {formatTime(pb.time_millis ?? 0)}
                     </td>
                     <td className="px-4 py-2 text-neutral-400">
-                      {new Date(pb.submittedAt).toLocaleString("en-US")}
+                      {new Date(pb.submitted_at).toLocaleString("en-US")}
                     </td>
                   </tr>
                 ))}
