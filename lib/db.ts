@@ -29,6 +29,7 @@ import {
   hashVerificationCode,
   isValidVerificationCodeFormat,
 } from "@/lib/verificationCode";
+import { normalizeRuneLiteAccountHash } from "@/lib/runeliteAccountHash";
 
 export const MAX_PB_DURATION_MS = 86_400_000;
 
@@ -468,26 +469,26 @@ export function revokeApiKeyForGameAccount(
 
 export function authenticateApiKeyHash(
   keyHash: string,
-): { userId: number; gameAccountId: number } | undefined {
-  const transaction = db.transaction(() => {
-    const row = db.prepare(`
-      SELECT account.user_id, key.game_account_id
+): { apiKeyId: number; userId: number; gameAccountId: number } | undefined {
+  const row = db.prepare(`
+      SELECT key.id, account.user_id, key.game_account_id
       FROM api_keys key
       JOIN game_accounts account ON account.id = key.game_account_id
       WHERE key.key_hash = ? AND key.revoked_at IS NULL
-    `).get(keyHash) as { user_id: number; game_account_id: number } | undefined;
-    if (!row) return undefined;
+    `).get(keyHash) as
+    | { id: number; user_id: number; game_account_id: number }
+    | undefined;
+  return row
+    ? { apiKeyId: row.id, userId: row.user_id, gameAccountId: row.game_account_id }
+    : undefined;
+}
 
-    db.prepare(`
-      UPDATE api_keys
-      SET last_used_at = ?
-      WHERE key_hash = ? AND revoked_at IS NULL
-    `).run(new Date().toISOString(), keyHash);
-
-    return { userId: row.user_id, gameAccountId: row.game_account_id };
-  });
-
-  return transaction();
+export function markApiKeyUsed(apiKeyId: number): void {
+  db.prepare(`
+    UPDATE api_keys
+    SET last_used_at = ?
+    WHERE id = ? AND revoked_at IS NULL
+  `).run(new Date().toISOString(), apiKeyId);
 }
 
 export interface AdminBoss {
@@ -533,6 +534,7 @@ export interface GameAccount {
   createdAt: string;
   updatedAt: string;
   verifiedAt: string | null;
+  runeliteAccountHash: string | null;
 }
 
 interface GameAccountRow {
@@ -544,6 +546,7 @@ interface GameAccountRow {
   created_at: string;
   updated_at: string;
   verified_at: string | null;
+  runelite_account_hash: string | null;
 }
 
 function rowToGameAccount(row: GameAccountRow): GameAccount {
@@ -556,12 +559,14 @@ function rowToGameAccount(row: GameAccountRow): GameAccount {
     createdAt: row.created_at,
     updatedAt: row.updated_at,
     verifiedAt: row.verified_at,
+    runeliteAccountHash: row.runelite_account_hash,
   };
 }
 
 export function getGameAccountsForUser(userId: number): GameAccount[] {
   const rows = db.prepare(`
-    SELECT id, user_id, rsn, normalized_rsn, verification_status, created_at, updated_at, verified_at
+    SELECT id, user_id, rsn, normalized_rsn, verification_status, created_at, updated_at,
+      verified_at, runelite_account_hash
     FROM game_accounts
     WHERE user_id = ? AND verified_at IS NOT NULL
     ORDER BY created_at ASC, id ASC
@@ -815,15 +820,22 @@ export type CompleteVerificationResult =
         | "VERIFICATION_CANCELLED"
         | "RSN_VERIFICATION_MISMATCH"
         | "RSN_ALREADY_LINKED"
+        | "INVALID_ACCOUNT_HASH"
+        | "ACCOUNT_HASH_ALREADY_LINKED"
         | "GAME_ACCOUNT_LIMIT_REACHED";
     };
 
 export function completeGameAccountVerification(
   inputRsn: string,
   inputCode: string,
+  inputAccountHash: unknown,
 ): CompleteVerificationResult {
   const validation = validateRsn(inputRsn);
   if (!validation.success) return { success: false, error: "INVALID_RSN" };
+  const accountHash = normalizeRuneLiteAccountHash(inputAccountHash);
+  if (!accountHash.success) {
+    return { success: false, error: "INVALID_ACCOUNT_HASH" };
+  }
   if (!isValidVerificationCodeFormat(inputCode)) {
     return { success: false, error: "INVALID_VERIFICATION_CODE" };
   }
@@ -857,6 +869,18 @@ export function completeGameAccountVerification(
         return { success: false as const, error: "RSN_ALREADY_LINKED" as const };
       }
 
+      const hashOwner = db.prepare(`
+        SELECT id
+        FROM game_accounts
+        WHERE runelite_account_hash = ?
+      `).get(accountHash.value) as { id: number } | undefined;
+      if (hashOwner && hashOwner.id !== existing?.id) {
+        return {
+          success: false as const,
+          error: "ACCOUNT_HASH_ALREADY_LINKED" as const,
+        };
+      }
+
       const accountCount = db.prepare(`
         SELECT COUNT(*) AS count
         FROM game_accounts
@@ -870,15 +894,23 @@ export function completeGameAccountVerification(
       if (existing) {
         db.prepare(`
           UPDATE game_accounts
-          SET rsn = ?, verification_status = 'VERIFIED', verified_at = ?, updated_at = ?
+          SET rsn = ?, verification_status = 'VERIFIED', verified_at = ?,
+            runelite_account_hash = ?, updated_at = ?
           WHERE id = ? AND user_id = ? AND verified_at IS NULL
-        `).run(validation.value.rsn, now, now, existing.id, attempt.user_id);
+        `).run(
+          validation.value.rsn,
+          now,
+          accountHash.value,
+          now,
+          existing.id,
+          attempt.user_id,
+        );
       } else {
         db.prepare(`
           INSERT INTO game_accounts (
             user_id, rsn, normalized_rsn, verification_status,
-            created_at, updated_at, verified_at
-          ) VALUES (?, ?, ?, 'VERIFIED', ?, ?, ?)
+            created_at, updated_at, verified_at, runelite_account_hash
+          ) VALUES (?, ?, ?, 'VERIFIED', ?, ?, ?, ?)
         `).run(
           attempt.user_id,
           validation.value.rsn,
@@ -886,6 +918,7 @@ export function completeGameAccountVerification(
           now,
           now,
           now,
+          accountHash.value,
         );
       }
 
@@ -910,6 +943,12 @@ export function completeGameAccountVerification(
     ) {
       return { success: false, error: "RSN_ALREADY_LINKED" };
     }
+    if (
+      error instanceof Error &&
+      error.message.includes("game_accounts.runelite_account_hash")
+    ) {
+      return { success: false, error: "ACCOUNT_HASH_ALREADY_LINKED" };
+    }
     console.error("Failed to complete game account verification");
     throw error;
   }
@@ -932,7 +971,8 @@ export function getGameAccountForUser(
   gameAccountId: number,
 ): GameAccount | undefined {
   const row = db.prepare(`
-    SELECT id, user_id, rsn, normalized_rsn, verification_status, created_at, updated_at, verified_at
+    SELECT id, user_id, rsn, normalized_rsn, verification_status, created_at, updated_at,
+      verified_at, runelite_account_hash
     FROM game_accounts
     WHERE id = ? AND user_id = ? AND verified_at IS NOT NULL
   `).get(gameAccountId, userId) as GameAccountRow | undefined;
@@ -1169,22 +1209,225 @@ export function processPbSubmission(input: {
 }
 
 export type ResolvePbSubmissionResult =
-  | { success: true; value: ProcessPbSubmissionResult }
-  | { success: false; code: "INVALID_RSN" | "GAME_ACCOUNT_NOT_LINKED" | "BOSS_NOT_FOUND" | "BOSS_DISABLED" | "INVALID_DURATION"; message: string };
+  | {
+      success: true;
+      value: ProcessPbSubmissionResult;
+      identity: RuneLiteIdentity;
+    }
+  | {
+      success: false;
+      code:
+        | "INVALID_RSN"
+        | "INVALID_ACCOUNT_HASH"
+        | "ACCOUNT_HASH_MISMATCH"
+        | "ACCOUNT_HASH_ALREADY_LINKED"
+        | "ACCOUNT_REVERIFICATION_REQUIRED"
+        | "GAME_ACCOUNT_NOT_LINKED"
+        | "RSN_ALREADY_LINKED"
+        | "BOSS_NOT_FOUND"
+        | "BOSS_DISABLED"
+        | "INVALID_DURATION";
+      message: string;
+    };
+
+export interface RuneLiteIdentity {
+  gameAccountId: number;
+  rsn: string;
+  nameChanged: boolean;
+  previousRsn?: string;
+}
+
+export type SynchronizeRuneLiteIdentityResult =
+  | { success: true; identity: RuneLiteIdentity }
+  | {
+      success: false;
+      code:
+        | "INVALID_RSN"
+        | "INVALID_ACCOUNT_HASH"
+        | "ACCOUNT_HASH_MISMATCH"
+        | "ACCOUNT_HASH_ALREADY_LINKED"
+        | "ACCOUNT_REVERIFICATION_REQUIRED"
+        | "GAME_ACCOUNT_NOT_LINKED"
+        | "RSN_ALREADY_LINKED";
+      message: string;
+    };
+
+export function synchronizeRuneLiteAccountIdentity(input: {
+  userId: number;
+  gameAccountId: number;
+  submittedRsn: string;
+  submittedAccountHash: unknown;
+}): SynchronizeRuneLiteIdentityResult {
+  const rsn = validateRsn(input.submittedRsn);
+  if (!rsn.success) {
+    return { success: false, code: "INVALID_RSN", message: rsn.message };
+  }
+  const accountHash = normalizeRuneLiteAccountHash(input.submittedAccountHash);
+  if (!accountHash.success) {
+    return {
+      success: false,
+      code: "INVALID_ACCOUNT_HASH",
+      message: "A valid RuneLite account hash is required.",
+    };
+  }
+
+  try {
+    return db.transaction(() => {
+      const account = db.prepare(`
+        SELECT id, user_id, rsn, normalized_rsn, verification_status,
+          created_at, updated_at, verified_at, runelite_account_hash
+        FROM game_accounts
+        WHERE id = ? AND user_id = ? AND verified_at IS NOT NULL
+      `).get(input.gameAccountId, input.userId) as GameAccountRow | undefined;
+      if (!account) {
+        return {
+          success: false as const,
+          code: "GAME_ACCOUNT_NOT_LINKED" as const,
+          message: "The secret is not linked to a verified RuneScape account.",
+        };
+      }
+
+      if (account.runelite_account_hash === null) {
+        if (account.normalized_rsn !== rsn.value.normalizedRsn) {
+          return {
+            success: false as const,
+            code: "ACCOUNT_REVERIFICATION_REQUIRED" as const,
+            message: "This legacy account must be reverified before changing its name.",
+          };
+        }
+        const hashOwner = db.prepare(`
+          SELECT id FROM game_accounts WHERE runelite_account_hash = ?
+        `).get(accountHash.value) as { id: number } | undefined;
+        if (hashOwner && hashOwner.id !== account.id) {
+          return {
+            success: false as const,
+            code: "ACCOUNT_HASH_ALREADY_LINKED" as const,
+            message: "This RuneLite account is already linked.",
+          };
+        }
+        db.prepare(`
+          UPDATE game_accounts
+          SET runelite_account_hash = ?, updated_at = ?
+          WHERE id = ? AND runelite_account_hash IS NULL
+        `).run(accountHash.value, new Date().toISOString(), account.id);
+        return {
+          success: true as const,
+          identity: {
+            gameAccountId: account.id,
+            rsn: account.rsn,
+            nameChanged: false,
+          },
+        };
+      }
+
+      if (account.runelite_account_hash !== accountHash.value) {
+        return {
+          success: false as const,
+          code: "ACCOUNT_HASH_MISMATCH" as const,
+          message: "The RuneLite account hash does not match this secret.",
+        };
+      }
+
+      if (account.normalized_rsn === rsn.value.normalizedRsn) {
+        return {
+          success: true as const,
+          identity: {
+            gameAccountId: account.id,
+            rsn: account.rsn,
+            nameChanged: false,
+          },
+        };
+      }
+
+      const nameOwner = db.prepare(`
+        SELECT id FROM game_accounts WHERE normalized_rsn = ?
+      `).get(rsn.value.normalizedRsn) as { id: number } | undefined;
+      if (nameOwner && nameOwner.id !== account.id) {
+        return {
+          success: false as const,
+          code: "RSN_ALREADY_LINKED" as const,
+          message: "The new RuneScape name is already linked.",
+        };
+      }
+
+      const now = new Date().toISOString();
+      db.prepare(`
+        INSERT INTO game_account_name_history (
+          game_account_id, previous_rsn, previous_normalized_rsn,
+          changed_to_rsn, changed_at, source
+        ) VALUES (?, ?, ?, ?, ?, 'RUNELITE_ACCOUNT_HASH_MATCH')
+      `).run(
+        account.id,
+        account.rsn,
+        account.normalized_rsn,
+        rsn.value.rsn,
+        now,
+      );
+      db.prepare(`
+        UPDATE game_accounts
+        SET rsn = ?, normalized_rsn = ?, updated_at = ?
+        WHERE id = ? AND runelite_account_hash = ?
+      `).run(
+        rsn.value.rsn,
+        rsn.value.normalizedRsn,
+        now,
+        account.id,
+        accountHash.value,
+      );
+
+      return {
+        success: true as const,
+        identity: {
+          gameAccountId: account.id,
+          rsn: rsn.value.rsn,
+          nameChanged: true,
+          previousRsn: account.rsn,
+        },
+      };
+    }).immediate();
+  } catch (error) {
+    if (
+      error instanceof Error &&
+      error.message.includes("game_accounts.runelite_account_hash")
+    ) {
+      return {
+        success: false,
+        code: "ACCOUNT_HASH_ALREADY_LINKED",
+        message: "This RuneLite account is already linked.",
+      };
+    }
+    if (
+      error instanceof Error &&
+      error.message.includes("game_accounts.normalized_rsn")
+    ) {
+      return {
+        success: false,
+        code: "RSN_ALREADY_LINKED",
+        message: "The new RuneScape name is already linked.",
+      };
+    }
+    console.error("Failed to synchronize RuneLite account identity");
+    throw error;
+  }
+}
 
 export function submitPbByRsn(input: {
   userId: number;
   gameAccountId: number;
   rsn: string;
+  accountHash: unknown;
   bossIdentifier: string;
   durationMs: number;
   source?: PbSubmissionSource;
   screenshotUrl?: string | null;
 }): ResolvePbSubmissionResult {
-  const rsnValidation = validateRsn(input.rsn);
-  if (!rsnValidation.success) {
-    return { success: false, code: "INVALID_RSN", message: rsnValidation.message };
-  }
+  const synchronization = synchronizeRuneLiteAccountIdentity({
+    userId: input.userId,
+    gameAccountId: input.gameAccountId,
+    submittedRsn: input.rsn,
+    submittedAccountHash: input.accountHash,
+  });
+  if (!synchronization.success) return synchronization;
 
   if (
     !Number.isSafeInteger(input.durationMs) ||
@@ -1195,26 +1438,6 @@ export function submitPbByRsn(input: {
       success: false,
       code: "INVALID_DURATION",
       message: `Duration must be a whole number between 1 and ${MAX_PB_DURATION_MS} milliseconds.`,
-    };
-  }
-
-  const account = db.prepare(`
-    SELECT id
-    FROM game_accounts
-    WHERE id = ?
-      AND normalized_rsn = ?
-      AND user_id = ?
-      AND verified_at IS NOT NULL
-  `).get(
-    input.gameAccountId,
-    normalizeRsn(input.rsn).normalizedRsn,
-    input.userId,
-  ) as { id: number } | undefined;
-  if (!account) {
-    return {
-      success: false,
-      code: "GAME_ACCOUNT_NOT_LINKED",
-      message: "This RuneScape account is not linked to your API key owner.",
     };
   }
 
@@ -1242,8 +1465,9 @@ export function submitPbByRsn(input: {
   try {
     return {
       success: true,
+      identity: synchronization.identity,
       value: processPbSubmission({
-        gameAccountId: account.id,
+        gameAccountId: synchronization.identity.gameAccountId,
         bossId: boss.id,
         durationMs: input.durationMs,
         source: input.source ?? "RUNELITE",

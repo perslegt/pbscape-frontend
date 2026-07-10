@@ -95,12 +95,27 @@ Content-Type: application/json
 
 {
   "rsn": "Rav e",
+  "accountHash": "734829104829104829",
   "verificationCode": "PB-7F3K-92QD"
 }
 ```
 
 De code verloopt na 15 minuten en kan slechts eenmaal worden gebruikt. Pas na
 succesvolle verificatie kan voor het account een RuneLite-secret worden gemaakt.
+
+De plugin verbindt en synchroniseert een PB-snapshot via:
+
+```http
+POST /api/runelite/connect
+Authorization: Bearer pb_live_xxxxxxxxxxxxxxxxx
+Content-Type: application/json
+
+{
+  "rsn": "Rav e",
+  "accountHash": "734829104829104829",
+  "personalBests": []
+}
+```
 
 ### Endpoint
 
@@ -115,6 +130,7 @@ Authorization: Bearer pb_live_xxxxxxxxxxxxxxxxx
 ```json
 {
   "rsn": "TestPlayer",
+  "accountHash": "734829104829104829",
   "bossSlug": "vorkath",
   "durationMs": 85000
 }
@@ -126,7 +142,7 @@ Authorization: Bearer pb_live_xxxxxxxxxxxxxxxxx
 curl -X POST http://localhost:3000/api/pb-submissions \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer pb_live_xxxxxxxxxxxxxxxxx" \
-  -d '{"rsn":"TestPlayer","bossSlug":"vorkath","durationMs":85000}'
+  -d '{"rsn":"TestPlayer","accountHash":"734829104829104829","bossSlug":"vorkath","durationMs":85000}'
 ```
 
 Verwacht resultaat (bij een nieuwe/betere PB):

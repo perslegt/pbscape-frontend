@@ -23,6 +23,7 @@ export interface SubmitPBRequest {
   bossSlug?: string;
   timeMillis?: number;
   durationMs?: number;
+  accountHash?: string;
   gameMessage?: string;
   pluginVersion?: string;
 }
@@ -32,7 +33,14 @@ export interface SubmitPBResponse {
   success: boolean;
   message: string;
   boss?: string;
-  error?: "INVALID_API_KEY" | "GAME_ACCOUNT_NOT_LINKED";
+  error?:
+    | "INVALID_API_KEY"
+    | "GAME_ACCOUNT_NOT_LINKED"
+    | "INVALID_ACCOUNT_HASH"
+    | "ACCOUNT_HASH_MISMATCH"
+    | "ACCOUNT_HASH_ALREADY_LINKED"
+    | "ACCOUNT_REVERIFICATION_REQUIRED"
+    | "RSN_ALREADY_LINKED";
   result?:
     | "FIRST_PERSONAL_BEST"
     | "NEW_PERSONAL_BEST"
@@ -41,6 +49,11 @@ export interface SubmitPBResponse {
   durationMs?: number;
   previousBestMs?: number | null;
   currentBestMs?: number;
+  identity?: {
+    nameChanged: boolean;
+    previousRsn?: string;
+    rsn: string;
+  };
 }
 
 // Bulk sync request: een speler stuurt al zijn PBs in één keer.
@@ -63,5 +76,10 @@ export interface SyncPBsResponse {
     updated: number;
     skipped: number;
     alreadyUploaded?: number;
+  };
+  identity?: {
+    nameChanged: boolean;
+    previousRsn?: string;
+    rsn: string;
   };
 }

@@ -4,7 +4,12 @@ import { authenticateApiKeyHash } from "@/lib/db";
 import { hashApiKey, isValidApiKeyFormat } from "@/lib/apiKeyCrypto";
 
 export type ApiKeyAuthenticationResult =
-  | { success: true; userId: number; gameAccountId: number }
+  | {
+      success: true;
+      apiKeyId: number;
+      userId: number;
+      gameAccountId: number;
+    }
   | { success: false };
 
 export function authenticateApiKey(
@@ -24,6 +29,7 @@ export function authenticateApiKey(
   return authenticated
     ? {
         success: true,
+        apiKeyId: authenticated.apiKeyId,
         userId: authenticated.userId,
         gameAccountId: authenticated.gameAccountId,
       }

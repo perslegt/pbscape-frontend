@@ -44,15 +44,26 @@ export async function POST(request: NextRequest) {
       { status: 400 },
     );
   }
+  if (record.accountHash === undefined) {
+    return NextResponse.json(
+      { success: false, error: "ACCOUNT_HASH_REQUIRED" },
+      { status: 400 },
+    );
+  }
 
   const result = completeGameAccountVerification(
     record.rsn,
     record.verificationCode,
+    record.accountHash,
   );
   if (!result.success) {
     const status =
       result.error === "INVALID_RSN"
         ? 400
+        : result.error === "INVALID_ACCOUNT_HASH"
+          ? 400
+          : result.error === "ACCOUNT_HASH_ALREADY_LINKED"
+            ? 409
         : result.error === "VERIFICATION_EXPIRED"
           ? 410
           : result.error === "VERIFICATION_ALREADY_USED"
