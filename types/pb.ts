@@ -15,7 +15,7 @@ export interface PersonalBest {
   updatedAt?: string;
 }
 
-// De body die de RuneLite plugin naar POST /api/pb stuurt.
+// De body die de RuneLite plugin naar POST /api/pb-submissions stuurt.
 export interface SubmitPBRequest {
   playerName?: string;
   rsn?: string;
@@ -25,14 +25,19 @@ export interface SubmitPBRequest {
   durationMs?: number;
   gameMessage?: string;
   pluginVersion?: string;
-  apiKey?: string;
 }
 
-// De JSON response die /api/pb teruggeeft.
+// De JSON response die /api/pb-submissions teruggeeft.
 export interface SubmitPBResponse {
   success: boolean;
   message: string;
-  result?: "FIRST_PERSONAL_BEST" | "NEW_PERSONAL_BEST" | "NOT_FASTER";
+  boss?: string;
+  error?: "INVALID_API_KEY" | "GAME_ACCOUNT_NOT_LINKED";
+  result?:
+    | "FIRST_PERSONAL_BEST"
+    | "NEW_PERSONAL_BEST"
+    | "NOT_FASTER"
+    | "ALREADY_UPLOADED";
   durationMs?: number;
   previousBestMs?: number | null;
   currentBestMs?: number;
@@ -41,7 +46,6 @@ export interface SubmitPBResponse {
 // Bulk sync request: een speler stuurt al zijn PBs in één keer.
 export interface SyncPBsRequest {
   playerName: string;
-  apiKey?: string;
   pbs: Array<{
     boss: string;
     timeMillis: number;
@@ -53,9 +57,11 @@ export interface SyncPBsRequest {
 export interface SyncPBsResponse {
   success: boolean;
   message: string;
+  boss?: string;
   stats?: {
     total: number;
     updated: number;
     skipped: number;
+    alreadyUploaded?: number;
   };
 }

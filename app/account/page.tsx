@@ -3,8 +3,10 @@ import Link from "next/link";
 import { redirect } from "next/navigation";
 import { auth } from "@/auth";
 import { LogoutButton } from "@/app/components/auth-buttons";
-import { addGameAccount, removeGameAccount } from "@/app/account/actions";
-import { getGameAccountsForUser } from "@/lib/db";
+import { removeGameAccount } from "@/app/account/actions";
+import { AccountVerification } from "@/app/account/account-verification";
+import { RuneLiteConnection } from "@/app/account/runelite-connection";
+import { getActiveApiKeysForUser, getGameAccountsForUser } from "@/lib/db";
 
 interface AccountPageProps {
   searchParams: { accountResult?: string; accountError?: string };
@@ -26,11 +28,14 @@ export default async function AccountPage({ searchParams }: AccountPageProps) {
   const gameAccounts = Number.isInteger(userId)
     ? getGameAccountsForUser(userId)
     : [];
+  const apiKeys = Number.isInteger(userId) ? getActiveApiKeysForUser(userId) : [];
   const successMessage =
     searchParams.accountResult === "added"
       ? "RuneScape account linked."
       : searchParams.accountResult === "removed"
         ? "RuneScape account removed."
+        : searchParams.accountResult === "keyRevoked"
+          ? "API key revoked."
         : null;
 
   return (
@@ -86,64 +91,50 @@ export default async function AccountPage({ searchParams }: AccountPageProps) {
             {gameAccounts.map((account) => (
               <li
                 key={account.id}
-                className="flex items-center justify-between gap-4 bg-neutral-900 px-4 py-3"
+                className="bg-neutral-900 px-4 py-3"
               >
-                <div>
-                  <Link
-                    href={`/account/accounts/${account.id}`}
-                    className="font-medium hover:text-gold"
-                  >
-                    {account.rsn}
-                  </Link>
-                  <p className="text-sm text-neutral-400">
-                    {account.verificationStatus === "UNVERIFIED"
-                      ? "Unverified"
-                      : account.verificationStatus === "VERIFIED"
-                        ? "Verified"
-                        : "Revoked"}
-                    {" · Linked "}
-                    {new Intl.DateTimeFormat("en-US", {
-                      dateStyle: "medium",
-                    }).format(new Date(account.createdAt))}
-                  </p>
+                <div className="flex items-start justify-between gap-4">
+                  <div>
+                    <Link
+                      href={`/account/accounts/${account.id}`}
+                      className="font-medium hover:text-gold"
+                    >
+                      {account.rsn}
+                    </Link>
+                    <p className="text-sm text-neutral-400">
+                      {account.verificationStatus === "UNVERIFIED"
+                        ? "Unverified"
+                        : account.verificationStatus === "VERIFIED"
+                          ? "Verified"
+                          : "Revoked"}
+                      {" · Linked "}
+                      {new Intl.DateTimeFormat("en-US", {
+                        dateStyle: "medium",
+                      }).format(new Date(account.createdAt))}
+                    </p>
+                  </div>
+                  <form action={removeGameAccount}>
+                    <input type="hidden" name="gameAccountId" value={account.id} />
+                    <button
+                      type="submit"
+                      className="rounded bg-red-950 px-3 py-1.5 text-sm font-semibold text-red-300 hover:bg-red-900"
+                    >
+                      Remove account
+                    </button>
+                  </form>
                 </div>
-                <form action={removeGameAccount}>
-                  <input
-                    type="hidden"
-                    name="gameAccountId"
-                    value={account.id}
-                  />
-                  <button
-                    type="submit"
-                    className="rounded bg-red-950 px-3 py-1.5 text-sm font-semibold text-red-300 hover:bg-red-900"
-                  >
-                    Remove
-                  </button>
-                </form>
+                <RuneLiteConnection
+                  gameAccountId={account.id}
+                  activeSecret={
+                    apiKeys.find((key) => key.gameAccountId === account.id) ?? null
+                  }
+                />
               </li>
             ))}
           </ul>
         )}
 
-        <form action={addGameAccount} className="flex max-w-md gap-3">
-          <label htmlFor="rsn" className="sr-only">
-            RuneScape name
-          </label>
-          <input
-            id="rsn"
-            name="rsn"
-            required
-            maxLength={64}
-            placeholder="RuneScape name"
-            className="min-w-0 flex-1 rounded border border-neutral-700 bg-neutral-900 px-3 py-2 text-sm outline-none focus:border-gold"
-          />
-          <button
-            type="submit"
-            className="rounded bg-gold px-4 py-2 text-sm font-semibold text-neutral-900 hover:opacity-90"
-          >
-            Add account
-          </button>
-        </form>
+        <AccountVerification />
       </div>
       <LogoutButton />
     </section>
