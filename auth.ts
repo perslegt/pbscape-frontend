@@ -33,6 +33,7 @@ export const { handlers, auth, signIn, signOut } = NextAuth({
         user.discordId = databaseUser.discordId;
         user.discordUsername = databaseUser.discordUsername;
         user.displayName = databaseUser.displayName;
+        user.role = databaseUser.role;
         return true;
       } catch {
         console.error("Discord sign-in rejected: database synchronization failed");
@@ -45,6 +46,7 @@ export const { handlers, auth, signIn, signOut } = NextAuth({
         token.discordId = user.discordId;
         token.discordUsername = user.discordUsername ?? null;
         token.displayName = user.displayName ?? null;
+        token.role = user.role ?? "user";
       }
 
       return token;
@@ -55,6 +57,7 @@ export const { handlers, auth, signIn, signOut } = NextAuth({
         session.user.discordId = token.discordId;
         session.user.discordUsername = token.discordUsername ?? null;
         session.user.displayName = token.displayName ?? null;
+        session.user.role = token.role ?? "user";
       }
 
       return session;

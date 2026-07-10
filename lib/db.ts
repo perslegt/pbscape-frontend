@@ -184,7 +184,10 @@ export interface DatabaseUser {
   avatarUrl: string | null;
   createdAt: string;
   updatedAt: string;
+  role: UserRole;
 }
+
+export type UserRole = "user" | "admin";
 
 interface UserRow {
   id: number;
@@ -194,6 +197,7 @@ interface UserRow {
   avatar_url: string | null;
   created_at: string;
   updated_at: string;
+  role: UserRole;
 }
 
 function rowToUser(row: UserRow): DatabaseUser {
@@ -205,6 +209,7 @@ function rowToUser(row: UserRow): DatabaseUser {
     avatarUrl: row.avatar_url,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
+    role: row.role,
   };
 }
 
@@ -227,7 +232,7 @@ export function upsertDiscordUser(profile: {
     WHERE users.discord_username IS NOT excluded.discord_username
        OR users.display_name IS NOT excluded.display_name
        OR users.avatar_url IS NOT excluded.avatar_url
-    RETURNING id, discord_id, discord_username, display_name, avatar_url, created_at, updated_at
+    RETURNING id, discord_id, discord_username, display_name, avatar_url, created_at, updated_at, role
   `).get(
     profile.discordId,
     profile.discordUsername,
@@ -242,7 +247,7 @@ export function upsertDiscordUser(profile: {
   }
 
   const existing = db.prepare(`
-    SELECT id, discord_id, discord_username, display_name, avatar_url, created_at, updated_at
+    SELECT id, discord_id, discord_username, display_name, avatar_url, created_at, updated_at, role
     FROM users
     WHERE discord_id = ?
   `).get(profile.discordId) as UserRow | undefined;
@@ -252,6 +257,48 @@ export function upsertDiscordUser(profile: {
   }
 
   return rowToUser(existing);
+}
+
+export function getUserById(id: number): DatabaseUser | undefined {
+  const row = db.prepare(`
+    SELECT id, discord_id, discord_username, display_name, avatar_url, created_at, updated_at, role
+    FROM users
+    WHERE id = ?
+  `).get(id) as UserRow | undefined;
+
+  return row ? rowToUser(row) : undefined;
+}
+
+export interface AdminBoss {
+  id: number;
+  slug: string;
+  name: string;
+  isActive: boolean;
+}
+
+export function getAllBosses(): AdminBoss[] {
+  const rows = db.prepare(`
+    SELECT id, slug, name, is_active
+    FROM bosses
+    ORDER BY name ASC
+  `).all() as Array<{ id: number; slug: string; name: string; is_active: number }>;
+
+  return rows.map((row) => ({
+    id: row.id,
+    slug: row.slug,
+    name: row.name,
+    isActive: row.is_active === 1,
+  }));
+}
+
+export function setBossActive(id: number, isActive: boolean): boolean {
+  const result = db.prepare(`
+    UPDATE bosses
+    SET is_active = ?
+    WHERE id = ?
+  `).run(isActive ? 1 : 0, id);
+
+  return result.changes === 1;
 }
 
 export interface SubmitPBResult {
