@@ -33,6 +33,11 @@ export default async function RootLayout({
               <Link href="/highscores" className="hover:text-gold">
                 Highscores
               </Link>
+              {session?.user?.role === "admin" && (
+                <Link href="/admin" className="hover:text-gold">
+                  Admin
+                </Link>
+              )}
               {session?.user ? (
                 <Link href="/account" className="hover:text-gold">
                   {name}

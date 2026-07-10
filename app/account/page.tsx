@@ -10,7 +10,11 @@ export default async function AccountPage() {
     redirect("/");
   }
 
-  const name = session.user.name ?? "Discord user";
+  const name =
+    session.user.displayName ??
+    session.user.discordUsername ??
+    session.user.name ??
+    "Discord user";
 
   return (
     <section className="space-y-6">

@@ -6,7 +6,9 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "lint": "next lint"
+    "lint": "next lint",
+    "db:migrate": "node scripts/migrate.js",
+    "user:set-role": "node scripts/set-user-role.js"
   },
   "dependencies": {
     "better-sqlite3": "^11.3.0",

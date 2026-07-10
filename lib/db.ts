@@ -176,6 +176,131 @@ export function getHighscoresForBossPaginated(bossSlug: string, page = 1, perPag
   return { data: rows.map(rowToPersonalBest), total: countRow.count, bossName: boss.name };
 }
 
+export interface DatabaseUser {
+  id: number;
+  discordId: string;
+  discordUsername: string | null;
+  displayName: string | null;
+  avatarUrl: string | null;
+  createdAt: string;
+  updatedAt: string;
+  role: UserRole;
+}
+
+export type UserRole = "user" | "admin";
+
+interface UserRow {
+  id: number;
+  discord_id: string;
+  discord_username: string | null;
+  display_name: string | null;
+  avatar_url: string | null;
+  created_at: string;
+  updated_at: string;
+  role: UserRole;
+}
+
+function rowToUser(row: UserRow): DatabaseUser {
+  return {
+    id: row.id,
+    discordId: row.discord_id,
+    discordUsername: row.discord_username,
+    displayName: row.display_name,
+    avatarUrl: row.avatar_url,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+    role: row.role,
+  };
+}
+
+export function upsertDiscordUser(profile: {
+  discordId: string;
+  discordUsername: string | null;
+  displayName: string | null;
+  avatarUrl: string | null;
+}): DatabaseUser {
+  const now = new Date().toISOString();
+  const row = db.prepare(`
+    INSERT INTO users (
+      discord_id, discord_username, display_name, avatar_url, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?)
+    ON CONFLICT(discord_id) DO UPDATE SET
+      discord_username = excluded.discord_username,
+      display_name = excluded.display_name,
+      avatar_url = excluded.avatar_url,
+      updated_at = excluded.updated_at
+    WHERE users.discord_username IS NOT excluded.discord_username
+       OR users.display_name IS NOT excluded.display_name
+       OR users.avatar_url IS NOT excluded.avatar_url
+    RETURNING id, discord_id, discord_username, display_name, avatar_url, created_at, updated_at, role
+  `).get(
+    profile.discordId,
+    profile.discordUsername,
+    profile.displayName,
+    profile.avatarUrl,
+    now,
+    now,
+  ) as UserRow | undefined;
+
+  if (row) {
+    return rowToUser(row);
+  }
+
+  const existing = db.prepare(`
+    SELECT id, discord_id, discord_username, display_name, avatar_url, created_at, updated_at, role
+    FROM users
+    WHERE discord_id = ?
+  `).get(profile.discordId) as UserRow | undefined;
+
+  if (!existing) {
+    throw new Error("Discord user upsert did not return a database user");
+  }
+
+  return rowToUser(existing);
+}
+
+export function getUserById(id: number): DatabaseUser | undefined {
+  const row = db.prepare(`
+    SELECT id, discord_id, discord_username, display_name, avatar_url, created_at, updated_at, role
+    FROM users
+    WHERE id = ?
+  `).get(id) as UserRow | undefined;
+
+  return row ? rowToUser(row) : undefined;
+}
+
+export interface AdminBoss {
+  id: number;
+  slug: string;
+  name: string;
+  isActive: boolean;
+}
+
+export function getAllBosses(): AdminBoss[] {
+  const rows = db.prepare(`
+    SELECT id, slug, name, is_active
+    FROM bosses
+    ORDER BY name ASC
+  `).all() as Array<{ id: number; slug: string; name: string; is_active: number }>;
+
+  return rows.map((row) => ({
+    id: row.id,
+    slug: row.slug,
+    name: row.name,
+    isActive: row.is_active === 1,
+  }));
+}
+
+export function setBossActive(id: number, isActive: boolean): boolean {
+  const result = db.prepare(`
+    UPDATE bosses
+    SET is_active = ?
+    WHERE id = ?
+  `).run(isActive ? 1 : 0, id);
+
+  return result.changes === 1;
+}
+
 export interface SubmitPBResult {
   success: boolean;
   message: string;
