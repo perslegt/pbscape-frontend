@@ -21,6 +21,7 @@ import path from "path";
 import fs from "fs";
 import { PersonalBest } from "@/types/pb";
 import { BOSSES } from "@/lib/bosses";
+import { validateRsn } from "@/lib/rsn";
 
 // Zorg dat de map "data/" bestaat voordat we het db-bestand aanmaken.
 const DATA_DIR = path.join(process.cwd(), "data");
@@ -42,6 +43,7 @@ if (process.env.NODE_ENV !== "production") {
 
 // Iets betere prestaties/gedrag voor een lokale SQLite-file.
 db.pragma("journal_mode = WAL");
+db.pragma("foreign_keys = ON");
 
 // CREATE TABLES
 db.exec(`
@@ -297,6 +299,132 @@ export function setBossActive(id: number, isActive: boolean): boolean {
     SET is_active = ?
     WHERE id = ?
   `).run(isActive ? 1 : 0, id);
+
+  return result.changes === 1;
+}
+
+export type VerificationStatus = "UNVERIFIED" | "VERIFIED" | "REVOKED";
+
+export interface GameAccount {
+  id: number;
+  userId: number;
+  rsn: string;
+  normalizedRsn: string;
+  verificationStatus: VerificationStatus;
+  createdAt: string;
+  updatedAt: string;
+}
+
+interface GameAccountRow {
+  id: number;
+  user_id: number;
+  rsn: string;
+  normalized_rsn: string;
+  verification_status: VerificationStatus;
+  created_at: string;
+  updated_at: string;
+}
+
+function rowToGameAccount(row: GameAccountRow): GameAccount {
+  return {
+    id: row.id,
+    userId: row.user_id,
+    rsn: row.rsn,
+    normalizedRsn: row.normalized_rsn,
+    verificationStatus: row.verification_status,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
+export function getGameAccountsForUser(userId: number): GameAccount[] {
+  const rows = db.prepare(`
+    SELECT id, user_id, rsn, normalized_rsn, verification_status, created_at, updated_at
+    FROM game_accounts
+    WHERE user_id = ?
+    ORDER BY created_at ASC, id ASC
+  `).all(userId) as GameAccountRow[];
+
+  return rows.map(rowToGameAccount);
+}
+
+export type CreateGameAccountResult =
+  | { success: true; account: GameAccount }
+  | { success: false; message: string };
+
+export function createGameAccountForUser(
+  userId: number,
+  input: string,
+): CreateGameAccountResult {
+  const validation = validateRsn(input);
+  if (!validation.success) {
+    return validation;
+  }
+
+  const accountCount = db.prepare(`
+    SELECT COUNT(*) AS count
+    FROM game_accounts
+    WHERE user_id = ?
+  `).get(userId) as { count: number };
+
+  if (accountCount.count >= 10) {
+    return {
+      success: false,
+      message: "You can link at most 10 RuneScape accounts.",
+    };
+  }
+
+  const now = new Date().toISOString();
+
+  try {
+    const row = db.prepare(`
+      INSERT INTO game_accounts (
+        user_id, rsn, normalized_rsn, verification_status, created_at, updated_at
+      ) VALUES (?, ?, ?, 'UNVERIFIED', ?, ?)
+      RETURNING id, user_id, rsn, normalized_rsn, verification_status, created_at, updated_at
+    `).get(
+      userId,
+      validation.value.rsn,
+      validation.value.normalizedRsn,
+      now,
+      now,
+    ) as GameAccountRow;
+
+    return { success: true, account: rowToGameAccount(row) };
+  } catch (error) {
+    if (error instanceof Error && error.message.includes("game_account_limit")) {
+      return {
+        success: false,
+        message: "You can link at most 10 RuneScape accounts.",
+      };
+    }
+
+    if (
+      error instanceof Error &&
+      error.message.includes("game_accounts.normalized_rsn")
+    ) {
+      return {
+        success: false,
+        message: "This RuneScape account is already linked.",
+      };
+    }
+
+    console.error("Failed to create RuneScape account");
+    return {
+      success: false,
+      message: "The RuneScape account could not be linked. Please try again.",
+    };
+  }
+}
+
+export function deleteGameAccountForUser(
+  userId: number,
+  gameAccountId: number,
+): boolean {
+  const result = db.prepare(`
+    DELETE FROM game_accounts
+    WHERE id = ? AND user_id = ?
+  `).run(gameAccountId, userId);
 
   return result.changes === 1;
 }
