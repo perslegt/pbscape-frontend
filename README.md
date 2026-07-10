@@ -19,7 +19,7 @@ PB's insturen via een API endpoint.
 app/
   page.tsx                 -> Homepage ("Latest updates")
   highscores/page.tsx      -> Highscores pagina (boss-tabs + ranking)
-  api/pb/route.ts          -> POST /api/pb endpoint voor de RuneLite plugin
+  api/pb-submissions/route.ts -> POST /api/pb-submissions voor de RuneLite plugin
   layout.tsx               -> Layout + navigatie
   globals.css              -> Tailwind setup
 lib/
@@ -57,12 +57,13 @@ cp .env.local.example .env.local
 Inhoud van `.env.local`:
 
 ```
-PB_API_KEY=dev-token
+AUTH_DISCORD_ID=
+AUTH_DISCORD_SECRET=
+AUTH_SECRET=
 ```
 
-Dit is de "wachtwoord"-token die de RuneLite plugin moet meesturen in
-het `apiKey` veld. Verander deze waarde gerust naar iets unieks van
-jezelf.
+Een RuneLite API-secret wordt na het inloggen bij één gekoppeld RuneScape-account gemaakt.
+De volledige secret wordt daar slechts eenmaal getoond en werkt alleen voor de RSN van dat account.
 
 ## 3. Lokaal draaien
 
@@ -83,55 +84,74 @@ bestand `data/highscores.db` en herstart `npm run dev`.
 
 ## 4. De API testen
 
+### RuneScape-account verifiëren
+
+Een ingelogde gebruiker start verificatie op de accountpagina. De RuneLite-plugin
+voltooit de koppeling zonder API-secret via:
+
+```http
+POST /api/game-accounts/verifications/complete
+Content-Type: application/json
+
+{
+  "rsn": "Rav e",
+  "verificationCode": "PB-7F3K-92QD"
+}
+```
+
+De code verloopt na 15 minuten en kan slechts eenmaal worden gebruikt. Pas na
+succesvolle verificatie kan voor het account een RuneLite-secret worden gemaakt.
+
 ### Endpoint
 
 ```
-POST http://localhost:3000/api/pb
+POST http://localhost:3000/api/pb-submissions
 Content-Type: application/json
+Authorization: Bearer pb_live_xxxxxxxxxxxxxxxxx
 ```
 
 ### Body
 
 ```json
 {
-  "player": "TestPlayer",
-  "boss": "Vorkath",
-  "timeMillis": 85000,
-  "apiKey": "dev-token"
+  "rsn": "TestPlayer",
+  "bossSlug": "vorkath",
+  "durationMs": 85000
 }
 ```
 
 ### Testen met cURL
 
 ```bash
-curl -X POST http://localhost:3000/api/pb \
+curl -X POST http://localhost:3000/api/pb-submissions \
   -H "Content-Type: application/json" \
-  -d '{"player":"TestPlayer","boss":"Vorkath","timeMillis":85000,"apiKey":"dev-token"}'
+  -H "Authorization: Bearer pb_live_xxxxxxxxxxxxxxxxx" \
+  -d '{"rsn":"TestPlayer","bossSlug":"vorkath","durationMs":85000}'
 ```
 
 Verwacht resultaat (bij een nieuwe/betere PB):
 
 ```json
-{ "success": true, "message": "New PB saved" }
+{ "success": true, "result": "FIRST_PERSONAL_BEST", "durationMs": 85000 }
 ```
 
 Stuur je daarna een **langzamere** tijd voor dezelfde speler/boss, dan
 krijg je:
 
 ```json
-{ "success": false, "message": "Submitted time is not faster than current PB" }
+{ "success": true, "result": "NOT_FASTER", "durationMs": 90000, "currentBestMs": 85000 }
 ```
 
 Stuur je een **snellere** tijd, dan wordt de PB bijgewerkt:
 
 ```json
-{ "success": true, "message": "PB improved and saved" }
+{ "success": true, "result": "NEW_PERSONAL_BEST", "durationMs": 80000, "previousBestMs": 85000 }
 ```
 
 ### Testen met Postman / Bruno
 
 1. Nieuwe request: `POST`
-2. URL: `http://localhost:3000/api/pb`
+2. URL: `http://localhost:3000/api/pb-submissions`
 3. Body: kies **raw** + **JSON**, plak het JSON-voorbeeld hierboven
 4. Verstuur en bekijk de response
 
@@ -139,10 +159,10 @@ Stuur je een **snellere** tijd, dan wordt de PB bijgewerkt:
 
 | Situatie | Response |
 |---|---|
-| Veld ontbreekt (bv. geen `boss`) | `400` — "Missing required field(s)..." |
-| `timeMillis` is geen positief getal | `400` — "'timeMillis' must be a positive number" |
-| Verkeerde `apiKey` | `401` — "Invalid API key" |
-| `PB_API_KEY` niet ingesteld op de server | `500` — "Server misconfiguration: PB_API_KEY not set" |
+| Vereist veld ontbreekt | `400` — "Missing required fields..." |
+| `durationMs` is geen geldige positieve integer | `400` — validatiefout |
+| Ontbrekende of ongeldige bearer key | `401` — `INVALID_API_KEY` |
+| RSN hoort niet bij de eigenaar van de key | `403` — `GAME_ACCOUNT_NOT_LINKED` |
 
 ## 5. Wat is er (bewust) nog niet gedaan?
 
@@ -155,7 +175,7 @@ Dit is een MVP. Bewust **niet** aanwezig:
   website-code eerst aangepast hoeft te worden)
 
 Logische vervolgstappen zodra de basis werkt:
-- Rate limiting / betere auth op `/api/pb`
+- Rate limiting op `/api/pb-submissions`
 - Overstappen naar een "echte" database (Postgres) als je naar
   productie/hosting gaat, aangezien SQLite-bestanden niet goed werken
   op sommige serverless hosting platforms (bv. Vercel's read-only

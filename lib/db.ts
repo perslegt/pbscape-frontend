@@ -23,6 +23,12 @@ import { PersonalBest } from "@/types/pb";
 import { BOSSES } from "@/lib/bosses";
 import { validateRsn } from "@/lib/rsn";
 import { normalizeRsn } from "@/lib/rsn";
+import { generateApiKey } from "@/lib/apiKeyCrypto";
+import {
+  generateVerificationCode,
+  hashVerificationCode,
+  isValidVerificationCodeFormat,
+} from "@/lib/verificationCode";
 
 export const MAX_PB_DURATION_MS = 86_400_000;
 
@@ -295,6 +301,195 @@ export function getUserById(id: number): DatabaseUser | undefined {
   return row ? rowToUser(row) : undefined;
 }
 
+export interface ApiKeyMetadata {
+  id: number;
+  gameAccountId: number;
+  keyPrefix: string;
+  createdAt: string;
+  lastUsedAt: string | null;
+}
+
+interface ApiKeyRow {
+  id: number;
+  game_account_id: number;
+  key_prefix: string;
+  created_at: string;
+  last_used_at: string | null;
+}
+
+function rowToApiKeyMetadata(row: ApiKeyRow): ApiKeyMetadata {
+  return {
+    id: row.id,
+    gameAccountId: row.game_account_id,
+    keyPrefix: row.key_prefix,
+    createdAt: row.created_at,
+    lastUsedAt: row.last_used_at,
+  };
+}
+
+export function getActiveApiKeysForUser(userId: number): ApiKeyMetadata[] {
+  const rows = db.prepare(`
+    SELECT key.id, key.game_account_id, key.key_prefix, key.created_at, key.last_used_at
+    FROM api_keys key
+    JOIN game_accounts account ON account.id = key.game_account_id
+    WHERE account.user_id = ?
+      AND account.verified_at IS NOT NULL
+      AND key.revoked_at IS NULL
+    ORDER BY key.created_at DESC, key.id DESC
+  `).all(userId) as ApiKeyRow[];
+
+  return rows.map(rowToApiKeyMetadata);
+}
+
+export type CreateApiKeyResult =
+  | { success: true; apiKey: ApiKeyMetadata; plaintext: string }
+  | { success: false; message: string };
+
+function writeApiKeyForGameAccount(
+  userId: number,
+  gameAccountId: number,
+  replace: boolean,
+): CreateApiKeyResult {
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const generated = generateApiKey();
+    try {
+      const transaction = db.transaction(() => {
+        const account = db.prepare(`
+          SELECT id
+          FROM game_accounts
+          WHERE id = ? AND user_id = ? AND verified_at IS NOT NULL
+        `).get(gameAccountId, userId) as { id: number } | undefined;
+        if (!account) {
+          throw new Error("GAME_ACCOUNT_NOT_OWNED");
+        }
+
+        const active = db.prepare(`
+          SELECT id
+          FROM api_keys
+          WHERE game_account_id = ? AND revoked_at IS NULL
+        `).get(gameAccountId) as { id: number } | undefined;
+        if (active && !replace) {
+          throw new Error("ACTIVE_SECRET_EXISTS");
+        }
+        if (active) {
+          db.prepare(`
+            UPDATE api_keys
+            SET revoked_at = ?
+            WHERE id = ? AND revoked_at IS NULL
+          `).run(new Date().toISOString(), active.id);
+        }
+
+        return db.prepare(`
+          INSERT INTO api_keys (
+            game_account_id, key_prefix, key_hash, created_at
+          ) VALUES (?, ?, ?, ?)
+          RETURNING id, game_account_id, key_prefix, created_at, last_used_at
+        `).get(
+          gameAccountId,
+          generated.prefix,
+          generated.hash,
+          new Date().toISOString(),
+        ) as ApiKeyRow;
+      });
+      const row = transaction();
+
+      return {
+        success: true,
+        apiKey: rowToApiKeyMetadata(row),
+        plaintext: generated.plaintext,
+      };
+    } catch (error) {
+      if (error instanceof Error && error.message === "GAME_ACCOUNT_NOT_OWNED") {
+        return {
+          success: false,
+          message: "RuneScape account not found.",
+        };
+      }
+      if (error instanceof Error && error.message === "ACTIVE_SECRET_EXISTS") {
+        return {
+          success: false,
+          message: "This RuneScape account already has an active secret.",
+        };
+      }
+      if (
+        error instanceof Error &&
+        error.message.includes("api_keys.key_hash") &&
+        attempt < 2
+      ) {
+        continue;
+      }
+      console.error("Failed to create API key");
+      return {
+        success: false,
+        message: "The API key could not be created. Please try again.",
+      };
+    }
+  }
+
+  return {
+    success: false,
+    message: "The API key could not be created. Please try again.",
+  };
+}
+
+export function createApiKeyForGameAccount(
+  userId: number,
+  gameAccountId: number,
+): CreateApiKeyResult {
+  return writeApiKeyForGameAccount(userId, gameAccountId, false);
+}
+
+export function replaceApiKeyForGameAccount(
+  userId: number,
+  gameAccountId: number,
+): CreateApiKeyResult {
+  return writeApiKeyForGameAccount(userId, gameAccountId, true);
+}
+
+export function revokeApiKeyForGameAccount(
+  userId: number,
+  gameAccountId: number,
+): boolean {
+  const result = db.prepare(`
+    UPDATE api_keys
+    SET revoked_at = ?
+    WHERE game_account_id = ?
+      AND revoked_at IS NULL
+      AND EXISTS (
+        SELECT 1
+        FROM game_accounts account
+        WHERE account.id = api_keys.game_account_id
+          AND account.user_id = ?
+      )
+  `).run(new Date().toISOString(), gameAccountId, userId);
+
+  return result.changes === 1;
+}
+
+export function authenticateApiKeyHash(
+  keyHash: string,
+): { userId: number; gameAccountId: number } | undefined {
+  const transaction = db.transaction(() => {
+    const row = db.prepare(`
+      SELECT account.user_id, key.game_account_id
+      FROM api_keys key
+      JOIN game_accounts account ON account.id = key.game_account_id
+      WHERE key.key_hash = ? AND key.revoked_at IS NULL
+    `).get(keyHash) as { user_id: number; game_account_id: number } | undefined;
+    if (!row) return undefined;
+
+    db.prepare(`
+      UPDATE api_keys
+      SET last_used_at = ?
+      WHERE key_hash = ? AND revoked_at IS NULL
+    `).run(new Date().toISOString(), keyHash);
+
+    return { userId: row.user_id, gameAccountId: row.game_account_id };
+  });
+
+  return transaction();
+}
+
 export interface AdminBoss {
   id: number;
   slug: string;
@@ -337,6 +532,7 @@ export interface GameAccount {
   verificationStatus: VerificationStatus;
   createdAt: string;
   updatedAt: string;
+  verifiedAt: string | null;
 }
 
 interface GameAccountRow {
@@ -347,6 +543,7 @@ interface GameAccountRow {
   verification_status: VerificationStatus;
   created_at: string;
   updated_at: string;
+  verified_at: string | null;
 }
 
 function rowToGameAccount(row: GameAccountRow): GameAccount {
@@ -358,86 +555,363 @@ function rowToGameAccount(row: GameAccountRow): GameAccount {
     verificationStatus: row.verification_status,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
+    verifiedAt: row.verified_at,
   };
 }
 
 export function getGameAccountsForUser(userId: number): GameAccount[] {
   const rows = db.prepare(`
-    SELECT id, user_id, rsn, normalized_rsn, verification_status, created_at, updated_at
+    SELECT id, user_id, rsn, normalized_rsn, verification_status, created_at, updated_at, verified_at
     FROM game_accounts
-    WHERE user_id = ?
+    WHERE user_id = ? AND verified_at IS NOT NULL
     ORDER BY created_at ASC, id ASC
   `).all(userId) as GameAccountRow[];
 
   return rows.map(rowToGameAccount);
 }
 
-export type CreateGameAccountResult =
-  | { success: true; account: GameAccount }
-  | { success: false; message: string };
+export type VerificationState =
+  | "PENDING"
+  | "VERIFIED"
+  | "EXPIRED"
+  | "CANCELLED";
 
-export function createGameAccountForUser(
-  userId: number,
-  input: string,
-): CreateGameAccountResult {
-  const validation = validateRsn(input);
-  if (!validation.success) {
-    return validation;
+export interface VerificationAttempt {
+  id: number;
+  rsn: string;
+  expiresAt: string;
+  state: VerificationState;
+}
+
+interface VerificationRow {
+  id: number;
+  user_id: number;
+  rsn: string;
+  normalized_rsn: string;
+  code_hash: string;
+  expires_at: string;
+  used_at: string | null;
+  cancelled_at: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+function verificationState(row: VerificationRow): VerificationState {
+  if (row.used_at) return "VERIFIED";
+  if (row.cancelled_at) return "CANCELLED";
+  if (new Date(row.expires_at).getTime() <= Date.now()) return "EXPIRED";
+  return "PENDING";
+}
+
+function consumeRateLimitUnsafe(
+  rateKey: string,
+  maximumAttempts: number,
+  windowMs: number,
+): boolean {
+  const now = new Date();
+  const existing = db.prepare(`
+    SELECT window_started_at, attempt_count
+    FROM verification_rate_limits
+    WHERE rate_key = ?
+  `).get(rateKey) as
+    | { window_started_at: string; attempt_count: number }
+    | undefined;
+
+  if (
+    !existing ||
+    now.getTime() - new Date(existing.window_started_at).getTime() >= windowMs
+  ) {
+    db.prepare(`
+      INSERT INTO verification_rate_limits (rate_key, window_started_at, attempt_count)
+      VALUES (?, ?, 1)
+      ON CONFLICT(rate_key) DO UPDATE SET
+        window_started_at = excluded.window_started_at,
+        attempt_count = 1
+    `).run(rateKey, now.toISOString());
+    return true;
   }
 
-  const accountCount = db.prepare(`
-    SELECT COUNT(*) AS count
-    FROM game_accounts
-    WHERE user_id = ?
-  `).get(userId) as { count: number };
+  if (existing.attempt_count >= maximumAttempts) return false;
+  db.prepare(`
+    UPDATE verification_rate_limits
+    SET attempt_count = attempt_count + 1
+    WHERE rate_key = ?
+  `).run(rateKey);
+  return true;
+}
 
-  if (accountCount.count >= 10) {
-    return {
-      success: false,
-      message: "You can link at most 10 RuneScape accounts.",
+export function consumeVerificationRateLimit(
+  rateKey: string,
+  maximumAttempts: number,
+  windowMs: number,
+): boolean {
+  return db.transaction(() =>
+    consumeRateLimitUnsafe(rateKey, maximumAttempts, windowMs),
+  ).immediate();
+}
+
+export type StartVerificationResult =
+  | {
+      success: true;
+      verification: VerificationAttempt & { code: string };
+    }
+  | {
+      success: false;
+      error:
+        | "INVALID_RSN"
+        | "RSN_ALREADY_LINKED"
+        | "GAME_ACCOUNT_LIMIT_REACHED"
+        | "RATE_LIMITED";
+      message: string;
     };
+
+export function startGameAccountVerification(
+  userId: number,
+  inputRsn: string,
+): StartVerificationResult {
+  const validation = validateRsn(inputRsn);
+  if (!validation.success) {
+    return { success: false, error: "INVALID_RSN", message: validation.message };
   }
 
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const code = generateVerificationCode();
+    try {
+      return db.transaction(() => {
+        if (!consumeRateLimitUnsafe(`verification-start:${userId}`, 5, 15 * 60_000)) {
+          return {
+            success: false as const,
+            error: "RATE_LIMITED" as const,
+            message: "Too many verification attempts. Please try again later.",
+          };
+        }
+
+        const existingAccount = db.prepare(`
+          SELECT user_id, verified_at
+          FROM game_accounts
+          WHERE normalized_rsn = ?
+        `).get(validation.value.normalizedRsn) as
+          | { user_id: number; verified_at: string | null }
+          | undefined;
+        if (
+          existingAccount &&
+          (existingAccount.user_id !== userId || existingAccount.verified_at)
+        ) {
+          return {
+            success: false as const,
+            error: "RSN_ALREADY_LINKED" as const,
+            message: "This RuneScape account is already linked.",
+          };
+        }
+
+        const accountCount = db.prepare(`
+          SELECT COUNT(*) AS count
+          FROM game_accounts
+          WHERE user_id = ? AND verified_at IS NOT NULL
+        `).get(userId) as { count: number };
+        if (accountCount.count >= 10) {
+          return {
+            success: false as const,
+            error: "GAME_ACCOUNT_LIMIT_REACHED" as const,
+            message: "You can link at most 10 RuneScape accounts.",
+          };
+        }
+
+        const now = new Date();
+        const expiresAt = new Date(now.getTime() + 15 * 60_000).toISOString();
+        db.prepare(`
+          UPDATE game_account_verifications
+          SET cancelled_at = ?, updated_at = ?
+          WHERE user_id = ? AND normalized_rsn = ?
+            AND used_at IS NULL AND cancelled_at IS NULL
+        `).run(
+          now.toISOString(),
+          now.toISOString(),
+          userId,
+          validation.value.normalizedRsn,
+        );
+
+        const row = db.prepare(`
+          INSERT INTO game_account_verifications (
+            user_id, rsn, normalized_rsn, code_hash, expires_at,
+            created_at, updated_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?)
+          RETURNING id
+        `).get(
+          userId,
+          validation.value.rsn,
+          validation.value.normalizedRsn,
+          code.hash,
+          expiresAt,
+          now.toISOString(),
+          now.toISOString(),
+        ) as { id: number };
+
+        return {
+          success: true as const,
+          verification: {
+            id: row.id,
+            rsn: validation.value.rsn,
+            code: code.plaintext,
+            expiresAt,
+            state: "PENDING" as const,
+          },
+        };
+      }).immediate();
+    } catch (error) {
+      if (
+        error instanceof Error &&
+        error.message.includes("game_account_verifications.code_hash") &&
+        attempt < 2
+      ) {
+        continue;
+      }
+      console.error("Failed to start game account verification");
+      throw error;
+    }
+  }
+
+  throw new Error("Failed to generate a unique verification code");
+}
+
+export function getVerificationForUser(
+  userId: number,
+  verificationId: number,
+): VerificationAttempt | undefined {
+  const row = db.prepare(`
+    SELECT id, user_id, rsn, normalized_rsn, code_hash, expires_at,
+      used_at, cancelled_at, created_at, updated_at
+    FROM game_account_verifications
+    WHERE id = ? AND user_id = ?
+  `).get(verificationId, userId) as VerificationRow | undefined;
+
+  return row
+    ? { id: row.id, rsn: row.rsn, expiresAt: row.expires_at, state: verificationState(row) }
+    : undefined;
+}
+
+export function cancelVerificationForUser(
+  userId: number,
+  verificationId: number,
+): boolean {
   const now = new Date().toISOString();
+  const result = db.prepare(`
+    UPDATE game_account_verifications
+    SET cancelled_at = ?, updated_at = ?
+    WHERE id = ? AND user_id = ? AND used_at IS NULL AND cancelled_at IS NULL
+  `).run(now, now, verificationId, userId);
+  return result.changes === 1;
+}
+
+export type CompleteVerificationResult =
+  | { success: true; rsn: string }
+  | {
+      success: false;
+      error:
+        | "INVALID_RSN"
+        | "INVALID_VERIFICATION_CODE"
+        | "VERIFICATION_EXPIRED"
+        | "VERIFICATION_ALREADY_USED"
+        | "VERIFICATION_CANCELLED"
+        | "RSN_VERIFICATION_MISMATCH"
+        | "RSN_ALREADY_LINKED"
+        | "GAME_ACCOUNT_LIMIT_REACHED";
+    };
+
+export function completeGameAccountVerification(
+  inputRsn: string,
+  inputCode: string,
+): CompleteVerificationResult {
+  const validation = validateRsn(inputRsn);
+  if (!validation.success) return { success: false, error: "INVALID_RSN" };
+  if (!isValidVerificationCodeFormat(inputCode)) {
+    return { success: false, error: "INVALID_VERIFICATION_CODE" };
+  }
 
   try {
-    const row = db.prepare(`
-      INSERT INTO game_accounts (
-        user_id, rsn, normalized_rsn, verification_status, created_at, updated_at
-      ) VALUES (?, ?, ?, 'UNVERIFIED', ?, ?)
-      RETURNING id, user_id, rsn, normalized_rsn, verification_status, created_at, updated_at
-    `).get(
-      userId,
-      validation.value.rsn,
-      validation.value.normalizedRsn,
-      now,
-      now,
-    ) as GameAccountRow;
+    return db.transaction(() => {
+      const attempt = db.prepare(`
+        SELECT id, user_id, rsn, normalized_rsn, code_hash, expires_at,
+          used_at, cancelled_at, created_at, updated_at
+        FROM game_account_verifications
+        WHERE code_hash = ?
+      `).get(hashVerificationCode(inputCode)) as VerificationRow | undefined;
+      if (!attempt) return { success: false as const, error: "INVALID_VERIFICATION_CODE" as const };
+      if (attempt.used_at) return { success: false as const, error: "VERIFICATION_ALREADY_USED" as const };
+      if (attempt.cancelled_at) return { success: false as const, error: "VERIFICATION_CANCELLED" as const };
+      if (new Date(attempt.expires_at).getTime() <= Date.now()) {
+        return { success: false as const, error: "VERIFICATION_EXPIRED" as const };
+      }
+      if (attempt.normalized_rsn !== validation.value.normalizedRsn) {
+        return { success: false as const, error: "RSN_VERIFICATION_MISMATCH" as const };
+      }
 
-    return { success: true, account: rowToGameAccount(row) };
+      const existing = db.prepare(`
+        SELECT id, user_id, verified_at
+        FROM game_accounts
+        WHERE normalized_rsn = ?
+      `).get(validation.value.normalizedRsn) as
+        | { id: number; user_id: number; verified_at: string | null }
+        | undefined;
+      if (existing && (existing.user_id !== attempt.user_id || existing.verified_at)) {
+        return { success: false as const, error: "RSN_ALREADY_LINKED" as const };
+      }
+
+      const accountCount = db.prepare(`
+        SELECT COUNT(*) AS count
+        FROM game_accounts
+        WHERE user_id = ? AND verified_at IS NOT NULL
+      `).get(attempt.user_id) as { count: number };
+      if (accountCount.count >= 10) {
+        return { success: false as const, error: "GAME_ACCOUNT_LIMIT_REACHED" as const };
+      }
+
+      const now = new Date().toISOString();
+      if (existing) {
+        db.prepare(`
+          UPDATE game_accounts
+          SET rsn = ?, verification_status = 'VERIFIED', verified_at = ?, updated_at = ?
+          WHERE id = ? AND user_id = ? AND verified_at IS NULL
+        `).run(validation.value.rsn, now, now, existing.id, attempt.user_id);
+      } else {
+        db.prepare(`
+          INSERT INTO game_accounts (
+            user_id, rsn, normalized_rsn, verification_status,
+            created_at, updated_at, verified_at
+          ) VALUES (?, ?, ?, 'VERIFIED', ?, ?, ?)
+        `).run(
+          attempt.user_id,
+          validation.value.rsn,
+          validation.value.normalizedRsn,
+          now,
+          now,
+          now,
+        );
+      }
+
+      db.prepare(`
+        UPDATE game_account_verifications
+        SET used_at = ?, updated_at = ?
+        WHERE id = ? AND used_at IS NULL AND cancelled_at IS NULL
+      `).run(now, now, attempt.id);
+      db.prepare(`
+        UPDATE game_account_verifications
+        SET cancelled_at = ?, updated_at = ?
+        WHERE normalized_rsn = ? AND id <> ?
+          AND used_at IS NULL AND cancelled_at IS NULL
+      `).run(now, now, attempt.normalized_rsn, attempt.id);
+
+      return { success: true as const, rsn: validation.value.rsn };
+    }).immediate();
   } catch (error) {
-    if (error instanceof Error && error.message.includes("game_account_limit")) {
-      return {
-        success: false,
-        message: "You can link at most 10 RuneScape accounts.",
-      };
-    }
-
     if (
       error instanceof Error &&
       error.message.includes("game_accounts.normalized_rsn")
     ) {
-      return {
-        success: false,
-        message: "This RuneScape account is already linked.",
-      };
+      return { success: false, error: "RSN_ALREADY_LINKED" };
     }
-
-    console.error("Failed to create RuneScape account");
-    return {
-      success: false,
-      message: "The RuneScape account could not be linked. Please try again.",
-    };
+    console.error("Failed to complete game account verification");
+    throw error;
   }
 }
 
@@ -458,9 +932,9 @@ export function getGameAccountForUser(
   gameAccountId: number,
 ): GameAccount | undefined {
   const row = db.prepare(`
-    SELECT id, user_id, rsn, normalized_rsn, verification_status, created_at, updated_at
+    SELECT id, user_id, rsn, normalized_rsn, verification_status, created_at, updated_at, verified_at
     FROM game_accounts
-    WHERE id = ? AND user_id = ?
+    WHERE id = ? AND user_id = ? AND verified_at IS NOT NULL
   `).get(gameAccountId, userId) as GameAccountRow | undefined;
 
   return row ? rowToGameAccount(row) : undefined;
@@ -544,7 +1018,8 @@ export type PbSubmissionSource = "RUNELITE" | "MANUAL" | "IMPORT" | "ADMIN";
 export type PbSubmissionOutcome =
   | "FIRST_PERSONAL_BEST"
   | "NEW_PERSONAL_BEST"
-  | "NOT_FASTER";
+  | "NOT_FASTER"
+  | "ALREADY_UPLOADED";
 
 export interface ProcessPbSubmissionResult {
   outcome: PbSubmissionOutcome;
@@ -598,6 +1073,29 @@ export function processPbSubmission(input: {
       WHERE game_account_id = ? AND boss_id = ?
     `).get(input.gameAccountId, input.bossId) as CurrentBestRow | undefined;
 
+    const duplicate = db.prepare(`
+      SELECT id
+      FROM pb_submissions
+      WHERE game_account_id = ?
+        AND boss_id = ?
+        AND duration_ms = ?
+        AND accepted = 1
+      LIMIT 1
+    `).get(
+      input.gameAccountId,
+      input.bossId,
+      input.durationMs,
+    ) as { id: number } | undefined;
+
+    if (duplicate) {
+      return {
+        outcome: "ALREADY_UPLOADED" as const,
+        durationMs: input.durationMs,
+        previousBestMs: previous?.best_duration_ms ?? null,
+        currentBestMs: previous?.best_duration_ms ?? input.durationMs,
+      };
+    }
+
     const submission = db.prepare(`
       INSERT INTO pb_submissions (
         game_account_id, boss_id, duration_ms, source, screenshot_url,
@@ -612,7 +1110,16 @@ export function processPbSubmission(input: {
       input.screenshotUrl ?? null,
       submittedAt,
       new Date().toISOString(),
-    ) as { id: number };
+    ) as { id: number } | undefined;
+
+    if (!submission) {
+      return {
+        outcome: "ALREADY_UPLOADED" as const,
+        durationMs: input.durationMs,
+        previousBestMs: previous?.best_duration_ms ?? null,
+        currentBestMs: previous?.best_duration_ms ?? input.durationMs,
+      };
+    }
 
     const improvesBest = !previous || input.durationMs < previous.best_duration_ms;
     if (improvesBest) {
@@ -663,9 +1170,11 @@ export function processPbSubmission(input: {
 
 export type ResolvePbSubmissionResult =
   | { success: true; value: ProcessPbSubmissionResult }
-  | { success: false; code: "INVALID_RSN" | "ACCOUNT_NOT_FOUND" | "BOSS_NOT_FOUND" | "BOSS_DISABLED" | "INVALID_DURATION"; message: string };
+  | { success: false; code: "INVALID_RSN" | "GAME_ACCOUNT_NOT_LINKED" | "BOSS_NOT_FOUND" | "BOSS_DISABLED" | "INVALID_DURATION"; message: string };
 
 export function submitPbByRsn(input: {
+  userId: number;
+  gameAccountId: number;
   rsn: string;
   bossIdentifier: string;
   durationMs: number;
@@ -692,10 +1201,21 @@ export function submitPbByRsn(input: {
   const account = db.prepare(`
     SELECT id
     FROM game_accounts
-    WHERE normalized_rsn = ?
-  `).get(normalizeRsn(input.rsn).normalizedRsn) as { id: number } | undefined;
+    WHERE id = ?
+      AND normalized_rsn = ?
+      AND user_id = ?
+      AND verified_at IS NOT NULL
+  `).get(
+    input.gameAccountId,
+    normalizeRsn(input.rsn).normalizedRsn,
+    input.userId,
+  ) as { id: number } | undefined;
   if (!account) {
-    return { success: false, code: "ACCOUNT_NOT_FOUND", message: "Linked RuneScape account not found." };
+    return {
+      success: false,
+      code: "GAME_ACCOUNT_NOT_LINKED",
+      message: "This RuneScape account is not linked to your API key owner.",
+    };
   }
 
   const bossSlug = slugify(input.bossIdentifier);
@@ -705,10 +1225,18 @@ export function submitPbByRsn(input: {
     WHERE slug = ?
   `).get(bossSlug) as { id: number; is_active: number } | undefined;
   if (!boss) {
-    return { success: false, code: "BOSS_NOT_FOUND", message: "Boss not found." };
+    return {
+      success: false,
+      code: "BOSS_NOT_FOUND",
+      message: `Boss "${input.bossIdentifier}" is not supported.`,
+    };
   }
   if (boss.is_active !== 1) {
-    return { success: false, code: "BOSS_DISABLED", message: "Submissions for this boss are disabled." };
+    return {
+      success: false,
+      code: "BOSS_DISABLED",
+      message: `Uploads for "${input.bossIdentifier}" are currently disabled.`,
+    };
   }
 
   try {
@@ -724,7 +1252,11 @@ export function submitPbByRsn(input: {
     };
   } catch (error) {
     if (error instanceof Error && error.message === "BOSS_DISABLED") {
-      return { success: false, code: "BOSS_DISABLED", message: "Submissions for this boss are disabled." };
+      return {
+        success: false,
+        code: "BOSS_DISABLED",
+        message: `Uploads for "${input.bossIdentifier}" are currently disabled.`,
+      };
     }
     console.error("Failed to process PB submission");
     throw error;

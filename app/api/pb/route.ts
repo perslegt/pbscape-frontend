@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { submitPbByRsn } from "@/lib/db";
+import { authenticateApiKey } from "@/lib/apiKeyAuth";
 import type { SubmitPBResponse, SyncPBsResponse } from "@/types/pb";
 
 export const dynamic = "force-dynamic";
@@ -31,12 +32,17 @@ function numberField(record: JsonRecord, ...keys: string[]): number | null {
 }
 
 function errorStatus(code: string): number {
-  if (code === "ACCOUNT_NOT_FOUND" || code === "BOSS_NOT_FOUND") return 404;
+  if (code === "GAME_ACCOUNT_NOT_LINKED") return 403;
+  if (code === "BOSS_NOT_FOUND") return 404;
   if (code === "BOSS_DISABLED") return 422;
   return 400;
 }
 
-function processRequestBody(body: JsonRecord) {
+function processRequestBody(
+  body: JsonRecord,
+  userId: number,
+  gameAccountId: number,
+) {
   const rsn = stringField(body, "rsn", "playerName");
   const bossIdentifier = stringField(body, "bossSlug", "boss");
   const durationMs = numberField(body, "durationMs", "timeMillis");
@@ -51,6 +57,8 @@ function processRequestBody(body: JsonRecord) {
   }
 
   return submitPbByRsn({
+    userId,
+    gameAccountId,
     rsn,
     bossIdentifier,
     durationMs,
@@ -60,6 +68,20 @@ function processRequestBody(body: JsonRecord) {
 }
 
 export async function POST(request: NextRequest) {
+  const authentication = authenticateApiKey(
+    request.headers.get("authorization"),
+  );
+  if (!authentication.success) {
+    return NextResponse.json<SubmitPBResponse>(
+      {
+        success: false,
+        error: "INVALID_API_KEY",
+        message: "API key authentication failed.",
+      },
+      { status: 401 },
+    );
+  }
+
   let body: unknown;
   try {
     body = await request.json();
@@ -77,10 +99,23 @@ export async function POST(request: NextRequest) {
     );
   }
 
-  const result = processRequestBody(body);
+  const result = processRequestBody(
+    body,
+    authentication.userId,
+    authentication.gameAccountId,
+  );
+  const boss = stringField(body, "bossSlug", "boss") ?? undefined;
   if (!result.success) {
     return NextResponse.json<SubmitPBResponse>(
-      { success: false, message: result.message },
+      {
+        success: false,
+        boss,
+        error:
+          result.code === "GAME_ACCOUNT_NOT_LINKED"
+            ? "GAME_ACCOUNT_NOT_LINKED"
+            : undefined,
+        message: result.message,
+      },
       { status: errorStatus(result.code) },
     );
   }
@@ -89,8 +124,11 @@ export async function POST(request: NextRequest) {
   return NextResponse.json<SubmitPBResponse>(
     {
       success: true,
+      boss,
       message:
-        value.outcome === "NOT_FASTER"
+        value.outcome === "ALREADY_UPLOADED"
+          ? "This personal best has already been uploaded."
+          : value.outcome === "NOT_FASTER"
           ? "Submission stored; current personal best is faster or equal."
           : "Personal best saved.",
       result: value.outcome,
@@ -103,6 +141,16 @@ export async function POST(request: NextRequest) {
 }
 
 export async function PUT(request: NextRequest) {
+  const authentication = authenticateApiKey(
+    request.headers.get("authorization"),
+  );
+  if (!authentication.success) {
+    return NextResponse.json<SyncPBsResponse>(
+      { success: false, message: "API key authentication failed." },
+      { status: 401 },
+    );
+  }
+
   let body: unknown;
   try {
     body = await request.json();
@@ -131,6 +179,7 @@ export async function PUT(request: NextRequest) {
 
   let updated = 0;
   let skipped = 0;
+  let alreadyUploaded = 0;
   for (const entry of entries) {
     if (!isRecord(entry)) {
       return NextResponse.json<SyncPBsResponse>(
@@ -139,21 +188,27 @@ export async function PUT(request: NextRequest) {
       );
     }
 
-    const result = processRequestBody({ ...entry, rsn });
+    const result = processRequestBody(
+      { ...entry, rsn },
+      authentication.userId,
+      authentication.gameAccountId,
+    );
+    const boss = stringField(entry, "bossSlug", "boss") ?? undefined;
     if (!result.success) {
       return NextResponse.json<SyncPBsResponse>(
-        { success: false, message: result.message },
+        { success: false, boss, message: result.message },
         { status: errorStatus(result.code) },
       );
     }
 
-    if (result.value.outcome === "NOT_FASTER") skipped += 1;
+    if (result.value.outcome === "ALREADY_UPLOADED") alreadyUploaded += 1;
+    else if (result.value.outcome === "NOT_FASTER") skipped += 1;
     else updated += 1;
   }
 
   return NextResponse.json<SyncPBsResponse>({
     success: true,
-    message: `${updated} PB(s) updated, ${skipped} stored without replacing a PB`,
-    stats: { total: entries.length, updated, skipped },
+    message: `${updated} PB(s) updated, ${skipped} stored without replacing a PB, ${alreadyUploaded} already uploaded`,
+    stats: { total: entries.length, updated, skipped, alreadyUploaded },
   });
 }

@@ -35,7 +35,7 @@ export default function HomePage() {
         {latestPBs.length === 0 ? (
           <p className="text-neutral-400">
             No personal bests yet. When the RuneLite plugin submits a PB to
-            <code>/api/pb</code>, it will appear here.
+            <code>/api/pb-submissions</code>, it will appear here.
           </p>
         ) : (
           <div className="overflow-x-auto rounded border border-neutral-800">
