@@ -9,6 +9,8 @@
 # lokale database (SQLite file)
 /data/*.db
 /data/*.db-journal
+/data/highscores.db-shm
+/data/highscores.db-wal
 
 # env files
 .env*
