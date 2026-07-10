@@ -8,16 +8,29 @@
  */
 export function formatTime(timeMillis: number): string {
   if (!Number.isFinite(timeMillis) || timeMillis < 0) {
-    return "0:00.00";
+    return "0 ms";
   }
 
-  const totalSeconds = timeMillis / 1000;
-  const minutes = Math.floor(totalSeconds / 60);
-  const seconds = totalSeconds - minutes * 60;
+  const milliseconds = Math.floor(timeMillis);
+  if (milliseconds < 1000) {
+    return `${milliseconds} ms`;
+  }
 
-  // Seconden altijd met 2 decimalen en voorloopnul (bv. "03.20"), zodat
-  // de tijd netjes uitlijnt in een tabel.
-  const secondsFormatted = seconds.toFixed(2).padStart(5, "0");
+  const totalTenths = Math.round(milliseconds / 100);
+  const totalSeconds = Math.floor(totalTenths / 10);
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+  const tenths = totalTenths % 10;
+  const secondsWithTenths = `${String(seconds).padStart(2, "0")}.${tenths}`;
 
-  return `${minutes}:${secondsFormatted}`;
+  if (hours > 0) {
+    return `${hours}:${String(minutes).padStart(2, "0")}:${secondsWithTenths}`;
+  }
+
+  if (minutes > 0) {
+    return `${String(minutes).padStart(2, "0")}:${secondsWithTenths}`;
+  }
+
+  return `${seconds}.${tenths}`;
 }
