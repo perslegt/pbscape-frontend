@@ -1,6 +1,7 @@
 import Link from "next/link";
 import { getLatestSubmissions } from "@/lib/db";
 import { formatTime } from "@/lib/formatTime";
+import { formatDateTime } from "@/lib/formatDateTime";
 
 // This page reads live from the database, so always render dynamically
 // (don't cache statically at "next build").
@@ -57,7 +58,7 @@ export default function HomePage() {
                       {formatTime(pb.time_millis ?? 0)}
                     </td>
                     <td className="px-4 py-2 text-neutral-400">
-                      {new Date(pb.submitted_at).toLocaleString("en-US")}
+                      {formatDateTime(pb.submitted_at)}
                     </td>
                   </tr>
                 ))}

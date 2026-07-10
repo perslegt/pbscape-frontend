@@ -1,6 +1,7 @@
 import Link from "next/link";
 import { getBosses, getHighscoresForBossPaginated } from "@/lib/db";
 import { formatTime } from "@/lib/formatTime";
+import { formatDateTime } from "@/lib/formatDateTime";
 
 // Always render dynamically, as rankings can change with new submissions
 export const dynamic = "force-dynamic";
@@ -102,7 +103,7 @@ export default function HighscoresPage({ searchParams }: HighscoresPageProps) {
                         {formatTime(pb.timeMillis)}
                       </td>
                       <td className="px-4 py-3 text-neutral-400">
-                        {new Date(pb.submittedAt).toLocaleDateString("en-US")}
+                        {formatDateTime(pb.submittedAt)}
                       </td>
                     </tr>
                   ))}

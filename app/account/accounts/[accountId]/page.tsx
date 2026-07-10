@@ -7,6 +7,7 @@ import {
   getSubmissionHistoryForGameAccount,
 } from "@/lib/db";
 import { formatTime } from "@/lib/formatTime";
+import { formatDateTime } from "@/lib/formatDateTime";
 
 export const dynamic = "force-dynamic";
 
@@ -33,7 +34,6 @@ export default async function GameAccountPage({ params }: GameAccountPageProps) 
 
   const personalBests = getPersonalBestsForGameAccount(account.id);
   const submissions = getSubmissionHistoryForGameAccount(account.id, 25);
-  const dateFormatter = new Intl.DateTimeFormat("en-US", { dateStyle: "medium" });
 
   return (
     <div className="space-y-8">
@@ -75,7 +75,7 @@ export default async function GameAccountPage({ params }: GameAccountPageProps) 
                       {formatTime(best.durationMs)}
                     </td>
                     <td className="px-4 py-3 text-neutral-400">
-                      {dateFormatter.format(new Date(best.achievedAt))}
+                      {formatDateTime(best.achievedAt)}
                     </td>
                   </tr>
                 ))}
@@ -117,7 +117,7 @@ export default async function GameAccountPage({ params }: GameAccountPageProps) 
                     </td>
                     <td className="px-4 py-3 text-neutral-400">{submission.source}</td>
                     <td className="px-4 py-3 text-neutral-400">
-                      {dateFormatter.format(new Date(submission.submittedAt))}
+                      {formatDateTime(submission.submittedAt)}
                     </td>
                   </tr>
                 ))}

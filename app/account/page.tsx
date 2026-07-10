@@ -7,6 +7,7 @@ import { removeGameAccount } from "@/app/account/actions";
 import { AccountVerification } from "@/app/account/account-verification";
 import { RuneLiteConnection } from "@/app/account/runelite-connection";
 import { getActiveApiKeysForUser, getGameAccountsForUser } from "@/lib/db";
+import { formatDateTime } from "@/lib/formatDateTime";
 
 interface AccountPageProps {
   searchParams: { accountResult?: string; accountError?: string };
@@ -108,9 +109,7 @@ export default async function AccountPage({ searchParams }: AccountPageProps) {
                           ? "Verified"
                           : "Revoked"}
                       {" · Linked "}
-                      {new Intl.DateTimeFormat("en-US", {
-                        dateStyle: "medium",
-                      }).format(new Date(account.createdAt))}
+                      {formatDateTime(account.createdAt)}
                     </p>
                   </div>
                   <form action={removeGameAccount}>
