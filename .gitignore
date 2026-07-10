@@ -10,9 +10,10 @@
 /data/*.db-journal
 
 # env files
-.env
-.env.local
+.env*
+!.env*.example
 
 # misc
 .DS_Store
 *.log
+*.tsbuildinfo
