@@ -1,5 +1,7 @@
 import type { Metadata } from "next";
 import Link from "next/link";
+import { auth } from "@/auth";
+import { DiscordLoginButton } from "@/app/components/auth-buttons";
 import "./globals.css";
 
 export const metadata: Metadata = {
@@ -7,11 +9,14 @@ export const metadata: Metadata = {
   description: "Personal best highscores for OSRS bosses, submitted via a RuneLite plugin.",
 };
 
-export default function RootLayout({
+export default async function RootLayout({
   children,
 }: {
   children: React.ReactNode;
 }) {
+  const session = await auth();
+  const name = session?.user?.name ?? "Discord user";
+
   return (
     <html lang="en">
       <body>
@@ -21,13 +26,20 @@ export default function RootLayout({
             <Link href="/" className="text-lg font-bold text-gold">
               PB Highscores
             </Link>
-            <div className="flex gap-6 text-sm">
+            <div className="flex items-center gap-6 text-sm">
               <Link href="/" className="hover:text-gold">
                 Home
               </Link>
               <Link href="/highscores" className="hover:text-gold">
                 Highscores
               </Link>
+              {session?.user ? (
+                <Link href="/account" className="hover:text-gold">
+                  {name}
+                </Link>
+              ) : (
+                <DiscordLoginButton />
+              )}
             </div>
           </nav>
         </header>
