@@ -21,6 +21,10 @@ import path from "path";
 import fs from "fs";
 import { PersonalBest } from "@/types/pb";
 import { BOSSES } from "@/lib/bosses";
+import { validateRsn } from "@/lib/rsn";
+import { normalizeRsn } from "@/lib/rsn";
+
+export const MAX_PB_DURATION_MS = 86_400_000;
 
 // Zorg dat de map "data/" bestaat voordat we het db-bestand aanmaken.
 const DATA_DIR = path.join(process.cwd(), "data");
@@ -42,6 +46,7 @@ if (process.env.NODE_ENV !== "production") {
 
 // Iets betere prestaties/gedrag voor een lokale SQLite-file.
 db.pragma("journal_mode = WAL");
+db.pragma("foreign_keys = ON");
 
 // CREATE TABLES
 db.exec(`
@@ -155,8 +160,28 @@ export function getBosses() {
 }
 
 export function getLatestSubmissions(limit = 10) {
-  const rows = db.prepare(`SELECT s.id, s.player_name, b.name as boss_name, s.time_millis, s.game_message, s.accepted, s.submitted_at FROM pb_submissions s LEFT JOIN bosses b ON s.boss_id = b.id ORDER BY s.submitted_at DESC LIMIT ?`).all(limit);
-  return rows as any[];
+  return db.prepare(`
+    SELECT
+      submission.id,
+      account.rsn AS player_name,
+      boss.name AS boss_name,
+      submission.duration_ms AS time_millis,
+      submission.accepted,
+      submission.submitted_at
+    FROM pb_submissions submission
+    JOIN game_accounts account ON account.id = submission.game_account_id
+    JOIN bosses boss ON boss.id = submission.boss_id
+    WHERE boss.is_active = 1
+    ORDER BY submission.submitted_at DESC, submission.id DESC
+    LIMIT ?
+  `).all(limit) as Array<{
+    id: number;
+    player_name: string;
+    boss_name: string;
+    time_millis: number;
+    accepted: number;
+    submitted_at: string;
+  }>;
 }
 
 export function getHighscoresForBossPaginated(bossSlug: string, page = 1, perPage = 25) {
@@ -166,11 +191,12 @@ export function getHighscoresForBossPaginated(bossSlug: string, page = 1, perPag
   const offset = (page - 1) * perPage;
   const countRow = db.prepare(`SELECT COUNT(*) as count FROM personal_bests WHERE boss_id = ?`).get(boss.id) as { count: number };
 
-  const rows = db.prepare(`SELECT pb.id, pb.player_name, pb.time_millis, pb.submitted_at, pb.updated_at, b.name as boss_name
+  const rows = db.prepare(`SELECT pb.id, account.rsn AS player_name, pb.best_duration_ms AS time_millis, pb.achieved_at AS submitted_at, pb.updated_at, b.name as boss_name
     FROM personal_bests pb
     JOIN bosses b ON pb.boss_id = b.id
+    JOIN game_accounts account ON account.id = pb.game_account_id
     WHERE pb.boss_id = ?
-    ORDER BY pb.time_millis ASC
+    ORDER BY pb.best_duration_ms ASC
     LIMIT ? OFFSET ?`).all(boss.id, perPage, offset) as PersonalBestRow[];
 
   return { data: rows.map(rowToPersonalBest), total: countRow.count, bossName: boss.name };
@@ -301,61 +327,406 @@ export function setBossActive(id: number, isActive: boolean): boolean {
   return result.changes === 1;
 }
 
-export interface SubmitPBResult {
-  success: boolean;
-  message: string;
+export type VerificationStatus = "UNVERIFIED" | "VERIFIED" | "REVOKED";
+
+export interface GameAccount {
+  id: number;
+  userId: number;
+  rsn: string;
+  normalizedRsn: string;
+  verificationStatus: VerificationStatus;
+  createdAt: string;
+  updatedAt: string;
 }
 
-export function handleSubmission(options: {
-  playerName: string;
-  bossSlug: string;
-  bossName?: string;
-  timeMillis: number;
-  gameMessage?: string;
-  pluginVersion?: string;
-  source?: string;
-  screenshotUrl?: string | null;
-  ipAddress?: string | null;
-}): SubmitPBResult {
-  const { playerName, bossSlug, bossName, timeMillis, gameMessage, pluginVersion, source = "plugin", screenshotUrl = null, ipAddress = null } = options;
+interface GameAccountRow {
+  id: number;
+  user_id: number;
+  rsn: string;
+  normalized_rsn: string;
+  verification_status: VerificationStatus;
+  created_at: string;
+  updated_at: string;
+}
+
+function rowToGameAccount(row: GameAccountRow): GameAccount {
+  return {
+    id: row.id,
+    userId: row.user_id,
+    rsn: row.rsn,
+    normalizedRsn: row.normalized_rsn,
+    verificationStatus: row.verification_status,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
+export function getGameAccountsForUser(userId: number): GameAccount[] {
+  const rows = db.prepare(`
+    SELECT id, user_id, rsn, normalized_rsn, verification_status, created_at, updated_at
+    FROM game_accounts
+    WHERE user_id = ?
+    ORDER BY created_at ASC, id ASC
+  `).all(userId) as GameAccountRow[];
+
+  return rows.map(rowToGameAccount);
+}
+
+export type CreateGameAccountResult =
+  | { success: true; account: GameAccount }
+  | { success: false; message: string };
+
+export function createGameAccountForUser(
+  userId: number,
+  input: string,
+): CreateGameAccountResult {
+  const validation = validateRsn(input);
+  if (!validation.success) {
+    return validation;
+  }
+
+  const accountCount = db.prepare(`
+    SELECT COUNT(*) AS count
+    FROM game_accounts
+    WHERE user_id = ?
+  `).get(userId) as { count: number };
+
+  if (accountCount.count >= 10) {
+    return {
+      success: false,
+      message: "You can link at most 10 RuneScape accounts.",
+    };
+  }
+
   const now = new Date().toISOString();
 
-  // Find or create boss
-  let boss = db.prepare(`SELECT id, name, min_time_millis, max_time_millis, is_active FROM bosses WHERE slug = ?`).get(bossSlug) as any;
+  try {
+    const row = db.prepare(`
+      INSERT INTO game_accounts (
+        user_id, rsn, normalized_rsn, verification_status, created_at, updated_at
+      ) VALUES (?, ?, ?, 'UNVERIFIED', ?, ?)
+      RETURNING id, user_id, rsn, normalized_rsn, verification_status, created_at, updated_at
+    `).get(
+      userId,
+      validation.value.rsn,
+      validation.value.normalizedRsn,
+      now,
+      now,
+    ) as GameAccountRow;
+
+    return { success: true, account: rowToGameAccount(row) };
+  } catch (error) {
+    if (error instanceof Error && error.message.includes("game_account_limit")) {
+      return {
+        success: false,
+        message: "You can link at most 10 RuneScape accounts.",
+      };
+    }
+
+    if (
+      error instanceof Error &&
+      error.message.includes("game_accounts.normalized_rsn")
+    ) {
+      return {
+        success: false,
+        message: "This RuneScape account is already linked.",
+      };
+    }
+
+    console.error("Failed to create RuneScape account");
+    return {
+      success: false,
+      message: "The RuneScape account could not be linked. Please try again.",
+    };
+  }
+}
+
+export function deleteGameAccountForUser(
+  userId: number,
+  gameAccountId: number,
+): boolean {
+  const result = db.prepare(`
+    DELETE FROM game_accounts
+    WHERE id = ? AND user_id = ?
+  `).run(gameAccountId, userId);
+
+  return result.changes === 1;
+}
+
+export function getGameAccountForUser(
+  userId: number,
+  gameAccountId: number,
+): GameAccount | undefined {
+  const row = db.prepare(`
+    SELECT id, user_id, rsn, normalized_rsn, verification_status, created_at, updated_at
+    FROM game_accounts
+    WHERE id = ? AND user_id = ?
+  `).get(gameAccountId, userId) as GameAccountRow | undefined;
+
+  return row ? rowToGameAccount(row) : undefined;
+}
+
+export interface AccountPersonalBest {
+  id: number;
+  bossName: string;
+  durationMs: number;
+  achievedAt: string;
+}
+
+export function getPersonalBestsForGameAccount(
+  gameAccountId: number,
+): AccountPersonalBest[] {
+  return db.prepare(`
+    SELECT
+      best.id,
+      boss.name AS bossName,
+      best.best_duration_ms AS durationMs,
+      best.achieved_at AS achievedAt
+    FROM personal_bests best
+    JOIN bosses boss ON boss.id = best.boss_id
+    WHERE best.game_account_id = ? AND boss.is_active = 1
+    ORDER BY boss.name ASC
+  `).all(gameAccountId) as AccountPersonalBest[];
+}
+
+export interface AccountSubmission {
+  id: number;
+  bossName: string;
+  durationMs: number;
+  source: PbSubmissionSource;
+  accepted: boolean;
+  rejectionReason: string | null;
+  becamePersonalBest: boolean;
+  submittedAt: string;
+}
+
+interface AccountSubmissionRow {
+  id: number;
+  bossName: string;
+  durationMs: number;
+  source: PbSubmissionSource;
+  accepted: number;
+  rejectionReason: string | null;
+  becamePersonalBest: number;
+  submittedAt: string;
+}
+
+export function getSubmissionHistoryForGameAccount(
+  gameAccountId: number,
+  limit = 25,
+): AccountSubmission[] {
+  const safeLimit = Math.min(Math.max(Math.floor(limit), 1), 100);
+  const rows = db.prepare(`
+    SELECT
+      submission.id,
+      boss.name AS bossName,
+      submission.duration_ms AS durationMs,
+      submission.source,
+      submission.accepted,
+      submission.rejection_reason AS rejectionReason,
+      submission.became_personal_best AS becamePersonalBest,
+      submission.submitted_at AS submittedAt
+    FROM pb_submissions submission
+    JOIN bosses boss ON boss.id = submission.boss_id
+    WHERE submission.game_account_id = ? AND boss.is_active = 1
+    ORDER BY submission.submitted_at DESC, submission.id DESC
+    LIMIT ?
+  `).all(gameAccountId, safeLimit) as AccountSubmissionRow[];
+
+  return rows.map((row) => ({
+    ...row,
+    accepted: row.accepted === 1,
+    becamePersonalBest: row.becamePersonalBest === 1,
+  }));
+}
+
+export type PbSubmissionSource = "RUNELITE" | "MANUAL" | "IMPORT" | "ADMIN";
+export type PbSubmissionOutcome =
+  | "FIRST_PERSONAL_BEST"
+  | "NEW_PERSONAL_BEST"
+  | "NOT_FASTER";
+
+export interface ProcessPbSubmissionResult {
+  outcome: PbSubmissionOutcome;
+  durationMs: number;
+  previousBestMs: number | null;
+  currentBestMs: number;
+}
+
+interface CurrentBestRow {
+  best_duration_ms: number;
+}
+
+export function processPbSubmission(input: {
+  gameAccountId: number;
+  bossId: number;
+  durationMs: number;
+  source: PbSubmissionSource;
+  screenshotUrl?: string | null;
+  submittedAt?: string;
+}): ProcessPbSubmissionResult {
+  const transaction = db.transaction(() => {
+    const account = db.prepare("SELECT id FROM game_accounts WHERE id = ?").get(
+      input.gameAccountId,
+    ) as { id: number } | undefined;
+    if (!account) {
+      throw new Error("GAME_ACCOUNT_NOT_FOUND");
+    }
+
+    const boss = db.prepare("SELECT id, is_active FROM bosses WHERE id = ?").get(
+      input.bossId,
+    ) as { id: number; is_active: number } | undefined;
+    if (!boss) {
+      throw new Error("BOSS_NOT_FOUND");
+    }
+    if (boss.is_active !== 1) {
+      throw new Error("BOSS_DISABLED");
+    }
+
+    if (
+      !Number.isSafeInteger(input.durationMs) ||
+      input.durationMs <= 0 ||
+      input.durationMs > MAX_PB_DURATION_MS
+    ) {
+      throw new Error("INVALID_DURATION");
+    }
+
+    const submittedAt = input.submittedAt ?? new Date().toISOString();
+    const previous = db.prepare(`
+      SELECT best_duration_ms
+      FROM personal_bests
+      WHERE game_account_id = ? AND boss_id = ?
+    `).get(input.gameAccountId, input.bossId) as CurrentBestRow | undefined;
+
+    const submission = db.prepare(`
+      INSERT INTO pb_submissions (
+        game_account_id, boss_id, duration_ms, source, screenshot_url,
+        accepted, submitted_at, created_at
+      ) VALUES (?, ?, ?, ?, ?, 1, ?, ?)
+      RETURNING id
+    `).get(
+      input.gameAccountId,
+      input.bossId,
+      input.durationMs,
+      input.source,
+      input.screenshotUrl ?? null,
+      submittedAt,
+      new Date().toISOString(),
+    ) as { id: number };
+
+    const improvesBest = !previous || input.durationMs < previous.best_duration_ms;
+    if (improvesBest) {
+      const now = new Date().toISOString();
+      db.prepare(`
+        INSERT INTO personal_bests (
+          game_account_id, boss_id, best_duration_ms, submission_id,
+          achieved_at, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(game_account_id, boss_id) DO UPDATE SET
+          best_duration_ms = excluded.best_duration_ms,
+          submission_id = excluded.submission_id,
+          achieved_at = excluded.achieved_at,
+          updated_at = excluded.updated_at
+        WHERE excluded.best_duration_ms < personal_bests.best_duration_ms
+      `).run(
+        input.gameAccountId,
+        input.bossId,
+        input.durationMs,
+        submission.id,
+        submittedAt,
+        now,
+        now,
+      );
+      db.prepare(`
+        UPDATE pb_submissions
+        SET became_personal_best = 1
+        WHERE id = ?
+      `).run(submission.id);
+    }
+
+    return {
+      outcome: !previous
+        ? "FIRST_PERSONAL_BEST" as const
+        : improvesBest
+          ? "NEW_PERSONAL_BEST" as const
+          : "NOT_FASTER" as const,
+      durationMs: input.durationMs,
+      previousBestMs: previous?.best_duration_ms ?? null,
+      currentBestMs: improvesBest
+        ? input.durationMs
+        : previous?.best_duration_ms ?? input.durationMs,
+    };
+  });
+
+  return transaction();
+}
+
+export type ResolvePbSubmissionResult =
+  | { success: true; value: ProcessPbSubmissionResult }
+  | { success: false; code: "INVALID_RSN" | "ACCOUNT_NOT_FOUND" | "BOSS_NOT_FOUND" | "BOSS_DISABLED" | "INVALID_DURATION"; message: string };
+
+export function submitPbByRsn(input: {
+  rsn: string;
+  bossIdentifier: string;
+  durationMs: number;
+  source?: PbSubmissionSource;
+  screenshotUrl?: string | null;
+}): ResolvePbSubmissionResult {
+  const rsnValidation = validateRsn(input.rsn);
+  if (!rsnValidation.success) {
+    return { success: false, code: "INVALID_RSN", message: rsnValidation.message };
+  }
+
+  if (
+    !Number.isSafeInteger(input.durationMs) ||
+    input.durationMs <= 0 ||
+    input.durationMs > MAX_PB_DURATION_MS
+  ) {
+    return {
+      success: false,
+      code: "INVALID_DURATION",
+      message: `Duration must be a whole number between 1 and ${MAX_PB_DURATION_MS} milliseconds.`,
+    };
+  }
+
+  const account = db.prepare(`
+    SELECT id
+    FROM game_accounts
+    WHERE normalized_rsn = ?
+  `).get(normalizeRsn(input.rsn).normalizedRsn) as { id: number } | undefined;
+  if (!account) {
+    return { success: false, code: "ACCOUNT_NOT_FOUND", message: "Linked RuneScape account not found." };
+  }
+
+  const bossSlug = slugify(input.bossIdentifier);
+  const boss = db.prepare(`
+    SELECT id, is_active
+    FROM bosses
+    WHERE slug = ?
+  `).get(bossSlug) as { id: number; is_active: number } | undefined;
   if (!boss) {
-    const insertBoss = db.prepare(`INSERT INTO bosses (slug, name, is_active) VALUES (?, ?, 0)`);
-    const insertResult = insertBoss.run(bossSlug, bossName || bossSlug);
-    boss = { id: Number(insertResult.lastInsertRowid), name: bossName || bossSlug, min_time_millis: null, max_time_millis: null, is_active: 0 };
+    return { success: false, code: "BOSS_NOT_FOUND", message: "Boss not found." };
+  }
+  if (boss.is_active !== 1) {
+    return { success: false, code: "BOSS_DISABLED", message: "Submissions for this boss are disabled." };
   }
 
-  if (!Number.isFinite(timeMillis) || timeMillis <= 0) {
-    return { success: false, message: "'timeMillis' must be a positive number" };
+  try {
+    return {
+      success: true,
+      value: processPbSubmission({
+        gameAccountId: account.id,
+        bossId: boss.id,
+        durationMs: input.durationMs,
+        source: input.source ?? "RUNELITE",
+        screenshotUrl: input.screenshotUrl,
+      }),
+    };
+  } catch (error) {
+    if (error instanceof Error && error.message === "BOSS_DISABLED") {
+      return { success: false, code: "BOSS_DISABLED", message: "Submissions for this boss are disabled." };
+    }
+    console.error("Failed to process PB submission");
+    throw error;
   }
-
-  if (boss.min_time_millis !== null && boss.min_time_millis !== undefined && timeMillis < boss.min_time_millis) {
-    return { success: false, message: "Submitted time below allowed minimum" };
-  }
-
-  if (boss.max_time_millis !== null && boss.max_time_millis !== undefined && timeMillis > boss.max_time_millis) {
-    return { success: false, message: "Submitted time above allowed maximum" };
-  }
-
-  // Insert submission first
-  const insertSub = db.prepare(`INSERT INTO pb_submissions (player_name, boss_id, time_millis, source, game_message, screenshot_url, plugin_version, ip_address, submitted_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`);
-  insertSub.run(playerName, boss.id, timeMillis, source, gameMessage || null, screenshotUrl, pluginVersion || null, ipAddress, now);
-
-  // Check existing PB
-  const existing = db.prepare(`SELECT * FROM personal_bests WHERE player_name = ? AND boss_id = ?`).get(playerName, boss.id) as any;
-
-  if (!existing) {
-    db.prepare(`INSERT INTO personal_bests (player_name, boss_id, time_millis, source, screenshot_url, game_message, submitted_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`).run(playerName, boss.id, timeMillis, source, screenshotUrl, gameMessage || null, now, now);
-    return { success: true, message: "New PB saved" };
-  }
-
-  if (timeMillis < existing.time_millis) {
-    db.prepare(`UPDATE personal_bests SET time_millis = ?, updated_at = ?, source = ?, screenshot_url = ?, game_message = ? WHERE id = ?`).run(timeMillis, now, source, screenshotUrl, gameMessage || null, existing.id);
-    return { success: true, message: "PB updated" };
-  }
-
-  return { success: false, message: "Submitted time is not faster than current PB" };
 }
