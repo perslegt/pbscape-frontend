@@ -1,4 +1,5 @@
 import Image from "next/image";
+import Link from "next/link";
 import { redirect } from "next/navigation";
 import { auth } from "@/auth";
 import { LogoutButton } from "@/app/components/auth-buttons";
@@ -88,7 +89,12 @@ export default async function AccountPage({ searchParams }: AccountPageProps) {
                 className="flex items-center justify-between gap-4 bg-neutral-900 px-4 py-3"
               >
                 <div>
-                  <p className="font-medium">{account.rsn}</p>
+                  <Link
+                    href={`/account/accounts/${account.id}`}
+                    className="font-medium hover:text-gold"
+                  >
+                    {account.rsn}
+                  </Link>
                   <p className="text-sm text-neutral-400">
                     {account.verificationStatus === "UNVERIFIED"
                       ? "Unverified"
