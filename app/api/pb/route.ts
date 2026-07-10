@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { submitPbByRsn } from "@/lib/db";
+import { markApiKeyUsed, submitPbByRsn } from "@/lib/db";
 import { authenticateApiKey } from "@/lib/apiKeyAuth";
 import type { SubmitPBResponse, SyncPBsResponse } from "@/types/pb";
 
@@ -33,9 +33,31 @@ function numberField(record: JsonRecord, ...keys: string[]): number | null {
 
 function errorStatus(code: string): number {
   if (code === "GAME_ACCOUNT_NOT_LINKED") return 403;
+  if (
+    code === "ACCOUNT_HASH_MISMATCH" ||
+    code === "ACCOUNT_REVERIFICATION_REQUIRED"
+  ) return 403;
+  if (
+    code === "ACCOUNT_HASH_ALREADY_LINKED" ||
+    code === "RSN_ALREADY_LINKED"
+  ) return 409;
   if (code === "BOSS_NOT_FOUND") return 404;
   if (code === "BOSS_DISABLED") return 422;
   return 400;
+}
+
+function responseError(code: string): SubmitPBResponse["error"] {
+  switch (code) {
+    case "GAME_ACCOUNT_NOT_LINKED":
+    case "INVALID_ACCOUNT_HASH":
+    case "ACCOUNT_HASH_MISMATCH":
+    case "ACCOUNT_HASH_ALREADY_LINKED":
+    case "ACCOUNT_REVERIFICATION_REQUIRED":
+    case "RSN_ALREADY_LINKED":
+      return code;
+    default:
+      return undefined;
+  }
 }
 
 function processRequestBody(
@@ -46,13 +68,14 @@ function processRequestBody(
   const rsn = stringField(body, "rsn", "playerName");
   const bossIdentifier = stringField(body, "bossSlug", "boss");
   const durationMs = numberField(body, "durationMs", "timeMillis");
+  const accountHash = body.accountHash;
 
-  if (!rsn || !bossIdentifier || durationMs === null) {
+  if (!rsn || !bossIdentifier || durationMs === null || accountHash === undefined) {
     return {
       success: false as const,
       code: "INVALID_REQUEST",
       message:
-        "Missing required fields. Expected rsn/playerName, bossSlug/boss, and durationMs/timeMillis.",
+        "Missing required fields. Expected rsn/playerName, accountHash, bossSlug/boss, and durationMs/timeMillis.",
     };
   }
 
@@ -60,6 +83,7 @@ function processRequestBody(
     userId,
     gameAccountId,
     rsn,
+    accountHash,
     bossIdentifier,
     durationMs,
     source: "RUNELITE",
@@ -110,10 +134,7 @@ export async function POST(request: NextRequest) {
       {
         success: false,
         boss,
-        error:
-          result.code === "GAME_ACCOUNT_NOT_LINKED"
-            ? "GAME_ACCOUNT_NOT_LINKED"
-            : undefined,
+        error: responseError(result.code),
         message: result.message,
       },
       { status: errorStatus(result.code) },
@@ -121,6 +142,7 @@ export async function POST(request: NextRequest) {
   }
 
   const value = result.value;
+  markApiKeyUsed(authentication.apiKeyId);
   return NextResponse.json<SubmitPBResponse>(
     {
       success: true,
@@ -135,6 +157,11 @@ export async function POST(request: NextRequest) {
       durationMs: value.durationMs,
       previousBestMs: value.previousBestMs,
       currentBestMs: value.currentBestMs,
+      identity: {
+        nameChanged: result.identity.nameChanged,
+        previousRsn: result.identity.previousRsn,
+        rsn: result.identity.rsn,
+      },
     },
     { status: value.outcome === "FIRST_PERSONAL_BEST" ? 201 : 200 },
   );
@@ -169,10 +196,11 @@ export async function PUT(request: NextRequest) {
   }
 
   const rsn = stringField(body, "rsn", "playerName");
+  const accountHash = body.accountHash;
   const entries = body.pbs;
-  if (!rsn || !Array.isArray(entries)) {
+  if (!rsn || accountHash === undefined || !Array.isArray(entries)) {
     return NextResponse.json<SyncPBsResponse>(
-      { success: false, message: "Expected rsn/playerName and a pbs array." },
+      { success: false, message: "Expected rsn/playerName, accountHash, and a pbs array." },
       { status: 400 },
     );
   }
@@ -180,6 +208,7 @@ export async function PUT(request: NextRequest) {
   let updated = 0;
   let skipped = 0;
   let alreadyUploaded = 0;
+  let identity: SyncPBsResponse["identity"];
   for (const entry of entries) {
     if (!isRecord(entry)) {
       return NextResponse.json<SyncPBsResponse>(
@@ -189,7 +218,7 @@ export async function PUT(request: NextRequest) {
     }
 
     const result = processRequestBody(
-      { ...entry, rsn },
+      { ...entry, rsn, accountHash },
       authentication.userId,
       authentication.gameAccountId,
     );
@@ -201,14 +230,22 @@ export async function PUT(request: NextRequest) {
       );
     }
 
+    identity = {
+      nameChanged: result.identity.nameChanged,
+      previousRsn: result.identity.previousRsn,
+      rsn: result.identity.rsn,
+    };
+
     if (result.value.outcome === "ALREADY_UPLOADED") alreadyUploaded += 1;
     else if (result.value.outcome === "NOT_FASTER") skipped += 1;
     else updated += 1;
   }
 
+  markApiKeyUsed(authentication.apiKeyId);
   return NextResponse.json<SyncPBsResponse>({
     success: true,
     message: `${updated} PB(s) updated, ${skipped} stored without replacing a PB, ${alreadyUploaded} already uploaded`,
     stats: { total: entries.length, updated, skipped, alreadyUploaded },
+    identity,
   });
 }

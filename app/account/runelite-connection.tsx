@@ -8,6 +8,7 @@ import {
   type ApiKeyCreationState,
 } from "@/app/account/actions";
 import type { ApiKeyMetadata } from "@/lib/db";
+import { formatDateTime } from "@/lib/formatDateTime";
 
 const initialState: ApiKeyCreationState = { plaintext: null, error: null };
 
@@ -37,12 +38,11 @@ export function RuneLiteConnection({
         {activeSecret && (
           <div className="mt-1 text-xs text-neutral-500">
             <p>Secret: {activeSecret.keyPrefix}&hellip;</p>
+            <p>Created: {formatDateTime(activeSecret.createdAt)}</p>
             <p>
               Last used:{" "}
               {activeSecret.lastUsedAt
-                ? new Intl.DateTimeFormat("en-US", { dateStyle: "medium" }).format(
-                    new Date(activeSecret.lastUsedAt),
-                  )
+                ? formatDateTime(activeSecret.lastUsedAt)
                 : "Never"}
             </p>
           </div>

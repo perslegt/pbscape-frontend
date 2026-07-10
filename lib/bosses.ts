@@ -9,6 +9,7 @@ export const BOSSES = [
   "Alchemical Hydra",
   "Amoxliatl",
   "Araxxor",
+  "Brutus",
   "Corrupted Gauntlet",
   "Doom of Mokhaïotl",
   "Duke Sucellus",
